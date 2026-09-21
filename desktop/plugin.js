@@ -108,6 +108,14 @@ const $snoozed = atom({})
 const $prefs = atom({ notify: true })
 /** pinned sessions — storedId -> { storedId, title, route, profile, at } */
 const $pinned = atom({})
+/** daily triage counter — { date: 'YYYY-MM-DD', count } */
+const $triage = atom({ date: '', count: 0 })
+/** last dismissed finished item — powers the undo chip */
+const $undo = atom(null)
+/** sessionKey -> recent latest_seq samples — the in-flight heartbeat */
+const seqHist = new Map()
+const SPARK_LEN = 14
+const STALE_MS = 10 * 60 * 1000
 /** request ids already notified about this app session */
 const notified = new Set()
 /** first scan seeds `notified` silently — no burst on app start */
@@ -119,6 +127,32 @@ const MUTED_KEY = 'muted.v1'
 const SNOOZE_KEY = 'snoozed.v1'
 const PREFS_KEY = 'prefs.v1'
 const PINNED_KEY = 'pinned.v1'
+const TRIAGE_KEY = 'triage.v1'
+
+let stylesInjected = false
+function ensureDayStyles() {
+  if (stylesInjected || typeof document === 'undefined') return
+  stylesInjected = true
+  const el = document.createElement('style')
+  el.textContent =
+    '@keyframes hday-confetti{0%{transform:translateY(-10vh) rotate(0)}100%{transform:translateY(110vh) rotate(720deg)}}' +
+    '@keyframes hday-stale{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}50%{box-shadow:0 0 0 3px rgba(239,68,68,.35)}}'
+  document.head.appendChild(el)
+}
+
+const dayStamp = () => new Date().toISOString().slice(0, 10)
+const triageToday = () => {
+  const t = $triage.get()
+  return t.date === dayStamp() ? t.count : 0
+}
+const bumpTriage = () => {
+  const t = $triage.get()
+  const next = { date: dayStamp(), count: (t.date === dayStamp() ? t.count : 0) + 1 }
+  $triage.set(next)
+  try {
+    storageRef && storageRef.set(TRIAGE_KEY, next)
+  } catch {}
+}
 
 /** kind -> accent color + icon + label — the card's identity at a glance */
 const KIND_STYLE = {
@@ -168,16 +202,25 @@ async function scanRoute(route) {
   }
 
   const sessions = Array.isArray(live && live.sessions) ? live.sessions : []
+  const seenKeys = new Set()
 
   await Promise.all(
     sessions.map(async s => {
       lastLive.set(s.id, { storedId: s.session_key || null, title: s.title || '', route })
+      const hkey = `${source.key}#${s.id}`
+      seenKeys.add(hkey)
       let open = []
       try {
         // last_seen past every seq -> empty event page, but the open-request
         // snapshot always ships — the cheap "what is this session asking" probe.
         const snap = await rpc(route, 'session.events.since', { session_id: s.id, last_seen: MAX_SEQ })
         open = snap && Array.isArray(snap.open_requests) ? snap.open_requests : []
+        if (snap && Number.isFinite(snap.latest_seq)) {
+          const h = seqHist.get(hkey) || []
+          h.push(snap.latest_seq)
+          while (h.length > SPARK_LEN + 1) h.shift()
+          seqHist.set(hkey, h)
+        }
       } catch {}
 
       for (const r of open) {
@@ -202,12 +245,14 @@ async function scanRoute(route) {
       }
 
       if (open.length === 0) {
-        const row = { route, sourceLabel: source.label, sourceKey: source.key, session: s }
+        const row = { route, sourceLabel: source.label, sourceKey: source.key, session: s, spark: seqHist.get(hkey) || [] }
         if (s.status === 'waiting') waiting.push(row)
         else if (FLIGHT.has(s.status)) flight.push(row)
       }
     })
   )
+
+  for (const k of seqHist.keys()) if (k.startsWith(source.key + '#') && !seenKeys.has(k)) seqHist.delete(k)
 
   // forget request ids that resolved between scans so re-asks re-stamp
   if (firstSeen.size > 400) {
@@ -377,7 +422,26 @@ const persistFinished = list => {
 }
 
 const dismissFinished = key => {
+  const item = $finished.get().find(f => f.key === key)
   const next = $finished.get().filter(f => f.key !== key)
+  $finished.set(next)
+  persistFinished(next)
+  if (item) {
+    $undo.set({ f: item })
+    const f = item
+    setTimeout(() => {
+      const u = $undo.get()
+      if (u && u.f === f) $undo.set(null)
+    }, 6000)
+    bumpTriage()
+  }
+}
+
+const undoDismiss = () => {
+  const u = $undo.get()
+  if (!u) return
+  $undo.set(null)
+  const next = [u.f, ...$finished.get().filter(f => f.key !== u.f.key)]
   $finished.set(next)
   persistFinished(next)
 }
@@ -427,10 +491,12 @@ async function respondApproval(item, choice) {
       choice
     })
   }
+  bumpTriage()
 }
 
 async function respondClarify(item, answer) {
   await rpc(item.route, 'request.answer', { id: item.requestId, result: { answer: answer ?? '' } })
+  bumpTriage()
 }
 
 async function respondClarifyBatch(item, answersByQid) {
@@ -441,6 +507,7 @@ async function respondClarifyBatch(item, answersByQid) {
     if (answer == null) continue
     await rpc(item.route, 'clarify.lock', { request_id: item.requestId, question_id: qid, answer })
   }
+  bumpTriage()
 }
 
 /** Kick off a brand-new task on the active profile — create + first prompt. */
@@ -571,7 +638,33 @@ function SnoozeMenu({ requestId, busy }) {
   })
 }
 
-function NeedsYouCard({ item, selected }) {
+/** tiny throughput sparkline — deltas of latest_seq between polls */
+function Spark({ seqs }) {
+  const diffs = []
+  for (let i = 1; i < seqs.length; i += 1) diffs.push(Math.max(0, seqs[i] - seqs[i - 1]))
+  if (diffs.length < 2) return null
+  const max = Math.max(1, ...diffs)
+  const w = 46
+  const h = 14
+  const step = w / (diffs.length - 1)
+  const pts = diffs.map((d, i) => `${(i * step).toFixed(1)},${(h - 2 - (d / max) * (h - 4)).toFixed(1)}`)
+  return jsxs('svg', {
+    width: w,
+    height: h,
+    'aria-hidden': true,
+    className: 'shrink-0 opacity-70',
+    children: jsx('polyline', {
+      points: pts.join(' '),
+      fill: 'none',
+      stroke: '#58a6ff',
+      strokeWidth: 1.5,
+      strokeLinecap: 'round',
+      strokeLinejoin: 'round'
+    })
+  })
+}
+
+function NeedsYouCard({ item, selected, longest }) {
   const [busy, setBusy] = useState('')
   const [failed, setFailed] = useState('')
 
@@ -599,6 +692,7 @@ function NeedsYouCard({ item, selected }) {
     })
 
   const accent = KIND_STYLE[item.kind] || KIND_STYLE.other
+  const stale = Date.now() - item.firstSeenAt > STALE_MS
 
   const header = jsxs('div', {
     className: 'flex min-w-0 items-center gap-2',
@@ -610,6 +704,13 @@ function NeedsYouCard({ item, selected }) {
         children: [jsx(Codicon, { name: accent.icon, size: 11 }), accent.label]
       }),
       jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.82rem] font-semibold', children: item.title }),
+      longest
+        ? jsxs('span', {
+            className: 'inline-flex shrink-0 items-center gap-1 rounded-[3px] px-1.5 py-px text-[0.62rem] font-semibold text-red-400',
+            style: { background: '#ef44441f' },
+            children: [jsx(Codicon, { name: 'flame', size: 11 }), 'waiting longest']
+          })
+        : null,
       jsx(SourcePill, { label: item.sourceLabel }),
       jsx(AgoText, { ms: item.firstSeenAt }),
       jsx(SnoozeMenu, { requestId: item.requestId, busy })
@@ -625,6 +726,7 @@ function NeedsYouCard({ item, selected }) {
     className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary) p-3 shadow-sm',
     style: {
       borderLeft: `3px solid ${accent.color}`,
+      ...(stale ? { animation: 'hday-stale 2.4s ease-in-out infinite' } : null),
       ...(selected ? { boxShadow: `0 0 0 2px ${accent.color}55` } : null)
     },
     children: [
@@ -980,6 +1082,7 @@ function FlightRow({ row }) {
             ]
           }),
           jsx(SourcePill, { label: row.sourceLabel }),
+          running ? jsx(Spark, { seqs: row.spark || [] }) : null,
           jsx(AgoText, { ms: epochMs(s.last_active) }),
           s.session_key
             ? jsx(Tip, {
@@ -1420,14 +1523,18 @@ function WatchingRow({ entry }) {
 }
 
 function DayPage() {
+  ensureDayStyles()
   const scan = useQuery({ queryKey: SCAN_QK, queryFn: scanInbox, refetchInterval: 5000, staleTime: 1500, refetchOnWindowFocus: true })
   const cron = useQuery({ queryKey: CRON_QK, queryFn: scanCron, refetchInterval: 30000, staleTime: 10000, refetchOnWindowFocus: true })
   const finishedAll = useValue($finished)
   const [filter, setFilter] = useState('')
   const [sel, setSel] = useState(0)
   const [celebrate, setCelebrate] = useState(false)
+  const [focus, setFocus] = useState(false)
   const prevNeeds = useRef(null)
   const pinnedMap = useValue($pinned)
+  const undo = useValue($undo)
+  useValue($triage)
 
   const data = scan.data
   const q = filter.trim().toLowerCase()
@@ -1534,6 +1641,13 @@ function DayPage() {
                   }),
               flight.length ? jsx(Badge, { variant: 'muted', children: `${flight.length} in flight` }) : null,
               finished.length ? jsx(Badge, { variant: 'muted', children: `${finished.length} to review` }) : null,
+              triageToday()
+                ? jsxs(Badge, {
+                    variant: 'outline',
+                    className: 'gap-1',
+                    children: [jsx(Codicon, { name: 'checklist' }), `${triageToday()} triaged`]
+                  })
+                : null,
               nextJob
                 ? jsxs(Badge, {
                     variant: 'outline',
@@ -1551,6 +1665,18 @@ function DayPage() {
                   variant: 'ghost',
                   onClick: () => setNotifyPref(!prefs.notify),
                   children: jsx(Codicon, { name: prefs.notify ? 'bell' : 'bell-slash', className: prefs.notify ? '' : 'text-muted-foreground/50' })
+                })
+              }),
+              jsx(Tip, {
+                label: focus ? 'Exit focus — show the whole board' : 'Focus — only what needs you and what is running',
+                children: jsx(Button, {
+                  size: 'icon-sm',
+                  variant: 'ghost',
+                  onClick: () => {
+                    setFocus(v => !v)
+                    haptic('selection')
+                  },
+                  children: jsx(Codicon, { name: focus ? 'eye-closed' : 'eye', className: focus ? '' : 'text-muted-foreground' })
                 })
               }),
               jsx(Tip, {
@@ -1626,7 +1752,7 @@ function DayPage() {
                           : null,
                         jsx('div', {
                           className: 'flex flex-col gap-2.5',
-                          children: needs.map((item, i) => jsx(NeedsYouCard, { item, selected: i === sel }, item.key))
+                          children: needs.map((item, i) => jsx(NeedsYouCard, { item, selected: i === sel, longest: i === 0 && needs.length > 1 }, item.key))
                         }),
                         hiddenCount
                           ? jsxs('div', {
@@ -1642,7 +1768,7 @@ function DayPage() {
                         children: [`${hiddenCount} item${hiddenCount === 1 ? '' : 's'} snoozed or from muted sources`]
                       })
                     : null,
-                waiting.length
+                !focus && waiting.length
                   ? jsxs('section', {
                       children: [
                         jsx(SectionLabel, { icon: 'watch', title: 'Waiting on input', count: waiting.length, tone: 'text-amber-500' }),
@@ -1658,7 +1784,7 @@ function DayPage() {
                       ]
                     })
                   : null,
-                finished.length
+                !focus && finished.length
                   ? jsxs('section', {
                       children: [
                         jsx(SectionLabel, { icon: 'pass', title: 'Finished — review', count: finished.length }),
@@ -1695,9 +1821,10 @@ function DayPage() {
                   : null
               ]
             }),
-            jsxs('aside', {
-              className: 'flex min-w-0 flex-col gap-6 xl:border-l xl:border-(--ui-stroke-secondary) xl:pl-8',
-              children: [
+            !focus
+              ? jsxs('aside', {
+                  className: 'flex min-w-0 flex-col gap-6 xl:border-l xl:border-(--ui-stroke-secondary) xl:pl-8',
+                  children: [
                 watching.length
                   ? jsxs('section', {
                       children: [
@@ -1750,12 +1877,34 @@ function DayPage() {
                       })
                     })
                   ]
+                }),
+                jsx('div', {
+                  className: 'border-t border-(--ui-stroke-secondary) px-2 pt-3 text-[0.68rem] text-muted-foreground/70',
+                  children: `Today · ${finishedAll.filter(f => Date.now() - f.at < 24 * 60 * 60 * 1000).length} finished · ${triageToday()} triaged`
                 })
               ]
             })
+              : null
           ]
         })
-      })
+      }),
+      undo
+        ? jsxs('div', {
+            className: 'fixed bottom-5 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary) px-3 py-2 shadow-lg',
+            children: [
+              jsxs('span', { className: 'text-[0.75rem] text-muted-foreground', children: ['Dismissed “', undo.f.title || 'session', '”'] }),
+              jsx(Button, {
+                size: 'xs',
+                variant: 'secondary',
+                onClick: () => {
+                  undoDismiss()
+                  haptic('selection')
+                },
+                children: 'Undo'
+              })
+            ]
+          })
+        : null
     ]
   })
 }
