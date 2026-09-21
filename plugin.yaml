@@ -1,0 +1,23 @@
+name: hermes-day
+version: 0.1.0
+description: >-
+  Full-screen day cockpit for Hermes Desktop. Triages everything waiting on
+  you — approvals, clarifies, input prompts — across every profile, bot and
+  remote connection, plus in-flight sessions, finished runs to review, and
+  scheduled jobs. One screen to manage your whole Hermes day.
+author: DECRUX9812
+license: MIT
+homepage: https://github.com/DECRUX9812/hermes-day
+requires_hermes: ">=0.1.0"
+kind: standalone
+tags:
+  - desktop
+  - inbox
+  - triage
+  - approvals
+  - day-management
+provides_tools: []
+provides_hooks: []
+provides_middleware: []
+requires_env: []
+config_schema: {}
