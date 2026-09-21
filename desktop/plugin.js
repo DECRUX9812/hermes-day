@@ -140,14 +140,40 @@ function ensureDayStyles() {
   const el = document.createElement('style')
   el.textContent =
     '@keyframes hday-confetti{0%{transform:translateY(-10vh) rotate(0)}100%{transform:translateY(110vh) rotate(720deg)}}' +
-    '@keyframes hday-stale{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}50%{box-shadow:0 0 0 3px rgba(239,68,68,.35)}}' +
-    '.hday-card{transition:transform .18s ease,box-shadow .18s ease}' +
-    '.hday-card:hover{transform:translateY(-1px);box-shadow:0 10px 28px -12px rgba(0,0,0,.5)}' +
-    '.hday-stat{transition:transform .15s ease,box-shadow .15s ease}' +
-    '.hday-stat:hover{transform:translateY(-1px);box-shadow:0 6px 18px -8px rgba(0,0,0,.4)}' +
-    '.hday-chip{transition:background .15s ease}' +
-    '.hday-chip:hover{background:var(--ui-bg-quaternary)}'
+    '@keyframes hday-stale{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}50%{box-shadow:0 0 0 2px rgba(239,68,68,.4)}}' +
+    '.hday-card{transition:box-shadow .15s ease,border-color .15s ease}' +
+    '.hday-card:hover{border-color:#333a47}' +
+    '.hday-stat{transition:border-color .12s ease,background .12s ease}' +
+    '.hday-stat:hover{background:#1a1d26;border-color:#333a47}' +
+    '.hday-row{transition:background .12s ease}' +
+    '.hday-row:hover{background:#1a1d26}' +
+    '.hday-chip{transition:border-color .12s ease,color .12s ease}' +
+    '.hday-chip:hover{border-color:#333a47;color:#e2e8f0}' +
+    // the app skin is light — pin our cockpit palette inside the page
+    '.hday-root [class*="text-muted-foreground"]{color:#94a3b8}' +
+    '.hday-root .text-destructive{color:#ef4444}' +
+    '.hday-root .text-amber-500{color:#f59e0b}' +
+    '.hday-root .text-emerald-500{color:#34d399}' +
+    '.hday-root .bg-emerald-500{background:#34d399}' +
+    '.hday-root .text-red-400{color:#f87171}'
   document.head.appendChild(el)
+}
+
+// design tokens — true dark cockpit, colors reserved for actionable state
+const C = {
+  canvas: '#0b0c10',
+  surface: '#161922',
+  surfaceHover: '#1a1d26',
+  border: '#262a33',
+  borderHover: '#333a47',
+  text: '#f3f4f6',
+  muted: '#94a3b8',
+  faint: '#64748b',
+  mono: '#38bdf8',
+  amber: '#f59e0b',
+  emerald: '#34d399',
+  red: '#ef4444',
+  slate: '#8b949e'
 }
 
 const dayStamp = () => new Date().toISOString().slice(0, 10)
@@ -166,10 +192,10 @@ const bumpTriage = () => {
 
 /** kind -> accent color + icon + label — the card's identity at a glance */
 const KIND_STYLE = {
-  approval: { icon: 'shield', label: 'Approval', color: '#f59e0b' },
-  clarify: { icon: 'comment-discussion', label: 'Question', color: '#3b82f6' },
-  input: { icon: 'keyboard', label: 'Input', color: '#a855f7' },
-  other: { icon: 'question', label: 'Request', color: '#8b949e' }
+  approval: { icon: 'shield', label: 'Approval', color: C.amber },
+  clarify: { icon: 'comment-discussion', label: 'Question', color: C.mono },
+  input: { icon: 'keyboard', label: 'Input', color: '#c084fc' },
+  other: { icon: 'question', label: 'Request', color: C.slate }
 }
 
 const routeKey = route =>
@@ -573,38 +599,39 @@ const invalidate = () => {
 // small shared bits
 // ---------------------------------------------------------------------------
 
-function SectionLabel({ icon, title, count, tone, color, action }) {
+function SectionLabel({ icon, title, count, color, action }) {
   return jsxs('div', {
     className: 'mb-2 flex items-center gap-2 px-1',
     children: [
       jsx('span', {
-        className: 'inline-flex size-5 items-center justify-center rounded-md',
-        style: { color: color || 'var(--ui-text-tertiary)', background: `${color || '#8b949e'}1f` },
+        className: 'inline-flex size-5 items-center justify-center rounded',
+        style: { color: color || C.faint, background: C.surface, border: `1px solid ${C.border}` },
         children: jsx(Codicon, { name: icon, size: 12 })
       }),
       jsx('span', {
-        className: 'text-[0.74rem] font-semibold uppercase tracking-wider text-(--ui-text-secondary)',
+        className: 'text-[0.7rem] font-semibold uppercase tracking-[0.12em]',
+        style: { color: C.muted },
         children: title
       }),
       typeof count === 'number'
         ? jsx('span', {
-            className: 'rounded-full px-1.5 py-px text-[0.62rem] font-semibold tabular-nums',
-            style: { color: color || 'var(--ui-text-tertiary)', background: `${color || '#8b949e'}1f` },
+            className: 'rounded px-1.5 py-px text-[0.62rem] font-semibold tabular-nums',
+            style: { color: color || C.muted, background: color ? `${color}1a` : C.surface, border: `1px solid ${C.border}` },
             children: String(count)
           })
         : null,
-      jsx('span', { className: 'mx-1 h-px flex-1 bg-(--ui-stroke-secondary) opacity-60' }),
+      jsx('span', { className: 'mx-1 h-px flex-1', style: { background: C.border } }),
       action || null
     ]
   })
 }
 
-/** big clickable stat tile — the hero strip's primary dashboard read */
+/** flat KPI tile — bold count, muted label, color only on the state dot/icon */
 function StatTile({ icon, label, n, color, scrollTo }) {
   return jsxs('button', {
     type: 'button',
-    className: 'hday-stat flex min-w-0 items-center gap-3 rounded-xl border border-(--ui-stroke-secondary) px-4 py-2.5 text-left',
-    style: { background: `linear-gradient(120deg, ${color}12, transparent 55%), var(--ui-bg-secondary)` },
+    className: 'hday-stat flex min-w-0 items-center gap-3 rounded-lg px-3.5 py-2.5 text-left',
+    style: { background: C.surface, border: `1px solid ${C.border}` },
     onClick: () => {
       if (scrollTo) {
         try {
@@ -615,15 +642,14 @@ function StatTile({ icon, label, n, color, scrollTo }) {
     },
     children: [
       jsx('span', {
-        className: 'inline-flex size-8 shrink-0 items-center justify-center rounded-lg',
-        style: { color, background: `${color}22` },
-        children: jsx(Codicon, { name: icon, size: 16 })
+        className: 'size-2 shrink-0 rounded-full',
+        style: { background: color }
       }),
       jsxs('span', {
-        className: 'flex min-w-0 flex-col',
+        className: 'flex min-w-0 items-baseline gap-2',
         children: [
-          jsx('span', { className: 'text-lg font-bold leading-5 tabular-nums', style: { color: n ? color : 'var(--ui-text-tertiary)' }, children: String(n) }),
-          jsx('span', { className: 'truncate text-[0.66rem] font-medium uppercase tracking-wider text-muted-foreground', children: label })
+          jsx('span', { className: 'text-xl font-bold leading-6 tabular-nums', style: { color: C.text }, children: String(n) }),
+          jsx('span', { className: 'truncate text-[0.68rem] font-medium uppercase tracking-wider', style: { color: C.faint }, children: label })
         ]
       })
     ]
@@ -632,7 +658,8 @@ function StatTile({ icon, label, n, color, scrollTo }) {
 
 function SourcePill({ label }) {
   return jsx('span', {
-    className: 'inline-flex shrink-0 items-center gap-1 rounded-[3px] bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.62rem] font-medium text-muted-foreground',
+    className: 'inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-px text-[0.62rem] font-medium',
+    style: { background: C.surfaceHover, color: C.faint, border: `1px solid ${C.border}` },
     children: label
   })
 }
@@ -640,7 +667,8 @@ function SourcePill({ label }) {
 function AgoText({ ms }) {
   if (!ms) return null
   return jsx('span', {
-    className: 'shrink-0 text-[0.68rem] tabular-nums text-muted-foreground/70',
+    className: 'shrink-0 text-[0.68rem] tabular-nums',
+    style: { color: C.faint },
     children: relativeTime(ms)
   })
 }
@@ -754,7 +782,7 @@ function NeedsYouCard({ item, selected, longest }) {
         style: { color: accent.color, background: `${accent.color}1f` },
         children: [jsx(Codicon, { name: accent.icon, size: 11 }), accent.label]
       }),
-      jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.82rem] font-semibold', children: item.title }),
+      jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.82rem] font-semibold', style: { color: C.text }, children: item.title }),
       longest
         ? jsxs('span', {
             className: 'inline-flex shrink-0 items-center gap-1 rounded-[3px] px-1.5 py-px text-[0.62rem] font-semibold text-red-400',
@@ -774,12 +802,13 @@ function NeedsYouCard({ item, selected, longest }) {
   else body = jsx(GenericRequestBody, { item, busy, open })
 
   return jsxs('div', {
-    className: 'hday-card rounded-xl border border-(--ui-stroke-secondary) p-3.5',
+    className: 'hday-card rounded-lg p-3.5',
     style: {
-      borderLeft: `3px solid ${accent.color}`,
-      background: `linear-gradient(100deg, ${accent.color}16 0%, transparent 45%), var(--ui-bg-secondary)`,
+      background: C.surface,
+      border: `1px solid ${C.border}`,
+      borderLeft: `2px solid ${accent.color}`,
       ...(stale ? { animation: 'hday-stale 2.4s ease-in-out infinite' } : null),
-      ...(selected ? { boxShadow: `0 0 0 2px ${accent.color}55` } : null)
+      ...(selected ? { boxShadow: `0 0 0 1px ${accent.color}66` } : null)
     },
     children: [
       header,
@@ -822,7 +851,7 @@ function ApprovalBody({ item, busy, run, open }) {
       p.command
         ? jsx('pre', {
             className: 'mb-2 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-lg p-2.5 font-mono text-[0.74rem] leading-5',
-            style: { background: 'rgba(13,17,23,.9)', color: '#e6edf3', border: '1px solid rgba(255,255,255,.09)' },
+            style: { background: '#0b0c10', color: C.mono, border: `1px solid ${C.border}` },
             children: String(p.command)
           })
         : null,
@@ -1114,11 +1143,10 @@ function FlightRow({ row }) {
   }
 
   return jsxs('div', {
-    className:
-      'group rounded-md border border-transparent transition-colors hover:border-(--ui-stroke-secondary) hover:bg-(--ui-bg-secondary)',
+    className: 'hday-row group rounded-md border border-transparent transition-colors',
     children: [
       jsxs('div', {
-        className: 'flex w-full cursor-pointer items-center gap-2.5 px-2 py-1.5',
+        className: 'flex w-full cursor-pointer items-center gap-2.5 px-2 py-1',
         onClick: open,
         children: [
           s.session_key
@@ -1127,9 +1155,9 @@ function FlightRow({ row }) {
           jsxs('div', {
             className: 'min-w-0 flex-1',
             children: [
-              jsx('div', { className: 'truncate text-[0.78rem] font-medium text-(--ui-text-primary)', children: s.title || 'Session' }),
+              jsx('div', { className: 'truncate text-[0.78rem] font-medium', style: { color: C.text }, children: s.title || 'Session' }),
               s.preview
-                ? jsx('div', { className: 'truncate text-[0.68rem] text-muted-foreground', children: s.preview })
+                ? jsx('div', { className: 'truncate font-mono text-[0.66rem]', style: { color: C.faint }, children: s.preview })
                 : null
             ]
           }),
@@ -1248,10 +1276,10 @@ function FinishedRow({ f }) {
   }
 
   return jsxs('div', {
-    className: 'group rounded-md hover:bg-(--ui-bg-secondary)',
+    className: 'hday-row group rounded-md',
     children: [
       jsxs('div', {
-        className: 'flex w-full items-center gap-2.5 px-2 py-1.5',
+        className: 'flex w-full items-center gap-2.5 px-2 py-1',
         children: [
           jsx(Codicon, {
             name: f.kind === 'error' ? 'error' : 'pass-filled',
@@ -1260,7 +1288,7 @@ function FinishedRow({ f }) {
           jsxs('div', {
             className: 'min-w-0 flex-1',
             children: [
-              jsx('div', { className: 'truncate text-[0.78rem] font-medium text-(--ui-text-primary)', children: f.title || 'Session' }),
+              jsx('div', { className: 'truncate text-[0.78rem] font-medium', style: { color: C.text }, children: f.title || 'Session' }),
               jsx('div', {
                 className: 'truncate text-[0.68rem] text-muted-foreground',
                 children: f.kind === 'error' ? 'Ended with an error' : 'Turn finished'
@@ -1337,7 +1365,7 @@ function CronRow({ entry }) {
   const nextAt = Date.parse(j.next_run_at || '')
   const failed = j.last_status === 'error' || j.last_status === 'failed' || Boolean(j.last_error)
   return jsxs('div', {
-    className: 'flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 hover:bg-(--ui-bg-secondary)',
+    className: 'hday-row flex w-full items-center gap-2.5 rounded-md px-2 py-1',
     children: [
       jsx(Codicon, {
         name: j.enabled === false ? 'circle-slash' : 'history',
@@ -1407,12 +1435,12 @@ function QuickTaskBar() {
   return jsxs('div', {
     children: [
       jsxs('div', {
-        className: 'flex items-center gap-2.5 rounded-xl border border-(--ui-stroke-secondary) px-4 py-2.5 shadow-sm',
-        style: { background: 'linear-gradient(100deg, rgba(88,166,255,.10), transparent 55%), var(--ui-bg-secondary)' },
+        className: 'flex items-center gap-2.5 rounded-lg px-4 py-2.5',
+        style: { background: C.surface, border: `1px solid ${C.border}` },
         children: [
           jsx('span', {
-            className: 'inline-flex size-7 shrink-0 items-center justify-center rounded-lg',
-            style: { color: '#58a6ff', background: '#58a6ff22' },
+            className: 'inline-flex size-7 shrink-0 items-center justify-center rounded',
+            style: { color: C.mono, background: C.surfaceHover, border: `1px solid ${C.border}` },
             children: jsx(Codicon, { name: 'sparkle', size: 14 })
           }),
           jsx(Input, {
@@ -1442,7 +1470,8 @@ function QuickTaskBar() {
             jsxs(
               'span',
               {
-                className: 'hday-chip group/chip inline-flex items-center gap-1 rounded-full border border-(--ui-stroke-secondary) px-2.5 py-0.5 text-[0.68rem] text-muted-foreground',
+                className: 'hday-chip group/chip inline-flex items-center gap-1 rounded px-2.5 py-0.5 text-[0.68rem]',
+                style: { border: `1px solid ${C.border}`, color: C.muted },
                 children: [
                   jsx('button', {
                     type: 'button',
@@ -1482,7 +1511,8 @@ function QuickTaskBar() {
               })
             : jsxs('button', {
                 type: 'button',
-                className: 'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.66rem] text-muted-foreground/70 hover:text-(--ui-text-primary)',
+                className: 'inline-flex items-center gap-1 rounded px-2 py-0.5 text-[0.66rem]',
+                style: { color: C.faint },
                 onClick: () => setAdding(true),
                 children: [jsx(Codicon, { name: 'add', size: 10 }), 'save a prompt']
               })
@@ -1507,8 +1537,8 @@ function ApproveAllBar({ sessionId, title, items }) {
     }
   }
   return jsxs('div', {
-    className:
-      'flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-1.5 text-[0.72rem]',
+    className: 'flex items-center gap-2 rounded-md px-3 py-1.5 text-[0.72rem]',
+    style: { background: C.surface, border: `1px solid rgba(245,158,11,.4)`, color: C.muted },
     children: [
       jsx(Codicon, { name: 'check-all', className: 'text-amber-500' }),
       jsxs('span', {
@@ -1532,15 +1562,7 @@ const greeting = () => {
   return 'Good evening'
 }
 
-/** accent tint for the header — follows the time of day */
-const dayTint = () => {
-  const h = new Date().getHours()
-  if (h < 5) return '#a855f7'
-  if (h < 12) return '#f59e0b'
-  if (h < 17) return '#58a6ff'
-  if (h < 21) return '#f472b6'
-  return '#a855f7'
-}
+
 
 // ---------------------------------------------------------------------------
 // day-arc hero + inbox-zero confetti
@@ -1634,7 +1656,7 @@ function WatchingRow({ entry }) {
     }
   }
   return jsxs('div', {
-    className: 'group flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-[0.72rem] hover:bg-(--ui-bg-secondary)',
+    className: 'hday-row group flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1 text-[0.72rem]',
     onClick: open,
     children: [
       jsx(SessionStatusDot, { storedSessionId: entry.storedId }),
@@ -1743,12 +1765,24 @@ function DayPage() {
     data && needs.length === 0 && flight.length === 0 && waiting.length === 0 && finished.length === 0 && jobs.length === 0
 
   return jsxs('div', {
-    className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-primary) text-(--ui-text-primary)',
+    className: 'hday-root flex h-full min-h-0 flex-col',
+    style: {
+      background: C.canvas,
+      color: C.text,
+      // force the dark cockpit palette — every (--ui-*) utility resolves to our tokens
+      '--ui-bg-primary': C.canvas,
+      '--ui-bg-secondary': C.surface,
+      '--ui-bg-quaternary': C.surfaceHover,
+      '--ui-stroke-secondary': C.border,
+      '--ui-text-primary': C.text,
+      '--ui-text-secondary': C.muted,
+      '--ui-text-tertiary': C.faint
+    },
     children: [
       celebrate ? jsx(Confetti, { onDone: () => setCelebrate(false) }) : null,
       jsxs('header', {
-        className: 'flex shrink-0 items-center justify-between gap-4 border-b border-(--ui-stroke-secondary) px-6 py-4',
-        style: { background: `linear-gradient(180deg, ${dayTint()}10, transparent)` },
+        className: 'flex shrink-0 items-center justify-between gap-4 px-6 py-4',
+        style: { borderBottom: `1px solid ${C.border}` },
         children: [
           jsxs('div', {
             className: 'flex min-w-0 items-baseline gap-3',
@@ -2040,7 +2074,8 @@ function DayPage() {
                   ]
                 }),
                 jsx('div', {
-                  className: 'border-t border-(--ui-stroke-secondary) px-2 pt-3 text-[0.68rem] text-muted-foreground/70',
+                  className: 'px-2 pt-3 text-[0.68rem]',
+                  style: { borderTop: `1px solid ${C.border}`, color: C.faint },
                   children: `Today · ${finishedAll.filter(f => Date.now() - f.at < 24 * 60 * 60 * 1000).length} finished · ${triageToday()} triaged`
                 })
               ]
@@ -2051,7 +2086,8 @@ function DayPage() {
       }),
       undo
         ? jsxs('div', {
-            className: 'fixed bottom-5 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary) px-3 py-2 shadow-lg',
+            className: 'fixed bottom-5 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3 rounded-lg px-3 py-2 shadow-lg',
+            style: { background: C.surface, border: `1px solid ${C.border}` },
             children: [
               jsxs('span', { className: 'text-[0.75rem] text-muted-foreground', children: ['Dismissed “', undo.f.title || 'session', '”'] }),
               jsx(Button, {
