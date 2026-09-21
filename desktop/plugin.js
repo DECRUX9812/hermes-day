@@ -1070,6 +1070,7 @@ export default {
         data: {
           id: 'hermes-day.open',
           label: 'Open Day',
+          action: 'hermes-day.open',
           keywords: ['inbox', 'triage', 'approvals', 'today', 'agenda'],
           run: () => host.navigate(DAY_PATH)
         }
