@@ -415,8 +415,12 @@ def _public_rec(rec: Dict[str, Any]) -> Dict[str, Any]:
         "at": rec.get("at") or 0,
         "blocks": len(rec.get("blocks") or []),
         "runs": len(rec.get("runs") or []),
-        "files": (rec.get("files") or [])[-5:],
+        "files": (rec.get("files") or [])[-8:],
         "nudges": rec.get("nudges") or 0,
+        "run_list": [{"cmd": r.get("cmd"), "exit": r.get("exit"), "ok": r.get("ok"),
+                      "ts": r.get("ts")} for r in (rec.get("runs") or [])[-8:]],
+        "block_list": [{"reason": b.get("reason"), "tool": b.get("tool"),
+                        "ts": b.get("ts")} for b in (rec.get("blocks") or [])[-8:]],
     }
 
 

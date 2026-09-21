@@ -14,6 +14,7 @@ import {
   Badge,
   Button,
   Codicon,
+  ErrorState,
   Input,
   Kbd,
   Loader,
@@ -159,7 +160,32 @@ function ensureDayStyles() {
     '.hday-root .text-amber-500{color:#f59e0b}' +
     '.hday-root .text-emerald-500{color:#34d399}' +
     '.hday-root .bg-emerald-500{background:#34d399}' +
-    '.hday-root .text-red-400{color:#f87171}'
+    '.hday-root .text-red-400{color:#f87171}' +
+    // inspector feed rows + tabs
+    '.hday-feedrow{cursor:pointer}' +
+    '.hday-feedrow.hday-sel{background:#1a1d26;box-shadow:inset 2px 0 0 #38bdf8}' +
+    '.hday-tab{cursor:pointer;border-bottom:1px solid transparent}' +
+    '.hday-tab:hover{color:#f3f4f6}' +
+    '.hday-tab.hday-tab-on{color:#f3f4f6;border-bottom-color:#38bdf8}' +
+    '.hday-diff-add{color:#34d399;background:rgba(52,211,153,.07)}' +
+    '.hday-diff-del{color:#ef4444;background:rgba(239,68,68,.07)}' +
+    '.hday-diff-hunk{color:#38bdf8}' +
+    // while /day is foreground, the host shell follows our dark canvas —
+    // sidebar + floating notices stop fighting the palette
+    'body:has(.hday-root) [class*="sidebar-wrapper"]{background:#0b0c10!important;color:#f3f4f6;'
+      + '--ui-bg-primary:#0b0c10;--ui-bg-secondary:#161922;--ui-bg-quaternary:#1a1d26;'
+      + '--ui-bg-sidebar:#0b0c10;--sidebar:#0b0c10;--sidebar-accent:#1a1d26;'
+      + '--ui-text-primary:#f3f4f6;--ui-text-secondary:#94a3b8;--ui-text-tertiary:#64748b;'
+      + '--ui-stroke-secondary:#262a33;--stroke-nous:#262a33}' +
+    'body:has(.hday-root) [class*="sidebar-wrapper"] [class*="text-muted-foreground"]{color:#94a3b8}' +
+    // dock the floating approval/notice modal: bottom-right tray, dark, never over the KPIs
+    'body:has(.hday-root) div[class*="over-modal"]{top:auto!important;bottom:14px!important;'
+      + 'left:auto!important;right:14px!important;transform:none!important;'
+      + 'width:min(370px,92vw)!important}' +
+    'body:has(.hday-root) div[class*="over-modal"] [class*="bg-popover"]{'
+      + 'background:#161922!important;color:#f3f4f6!important;border-color:#262a33!important;'
+      + 'backdrop-filter:none!important;box-shadow:0 8px 28px rgba(0,0,0,.55)!important}' +
+    'body:has(.hday-root) div[class*="over-modal"] [class*="text-muted-foreground"]{color:#94a3b8!important}'
   document.head.appendChild(el)
 }
 
@@ -1726,6 +1752,494 @@ function WatchingRow({ entry }) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// workbench — unified feed row + live inspector
+// ---------------------------------------------------------------------------
+
+const FEED_ICON = {
+  need: (e) => KIND_STYLE[e.item.kind] || KIND_STYLE.other,
+  waiting: () => ({ icon: 'watch', color: C.amber }),
+  flight: () => ({ icon: 'rocket', color: C.emerald }),
+  finished: (e) => ({ icon: e.f.kind === 'error' ? 'error' : 'pass-filled', color: e.f.kind === 'error' ? C.red : C.emerald })
+}
+
+function feedTitle(e) {
+  if (e.type === 'need') return e.item.title || 'Session'
+  if (e.type === 'finished') return e.f.title || 'Session'
+  return e.row.session.title || 'Session'
+}
+
+function feedSub(e) {
+  if (e.type === 'need') {
+    const p = e.item.params || {}
+    if (e.item.kind === 'approval') return p.command || p.description || e.item.method
+    if (e.item.kind === 'clarify') {
+      const qs = (p.questions || []).map(x => x.question || x).join(' · ')
+      return qs || e.item.method
+    }
+    return p.prompt || p.message || e.item.method
+  }
+  if (e.type === 'finished') return e.f.kind === 'error' ? 'Ended with an error' : 'Turn finished'
+  return e.row.session.preview || ''
+}
+
+function feedAt(e) {
+  if (e.type === 'need') return e.item.firstSeenAt
+  if (e.type === 'finished') return e.f.at
+  return (epochMs(e.row.session.last_active) || Date.now())
+}
+
+function feedEvidence(e, evMap) {
+  if (e.type === 'finished') return evidenceFor(e.f, evMap)
+  const storedId = e.type === 'need' ? e.item.storedId : e.row.session.session_key
+  if (!storedId) return null
+  const sk = `${e.type === 'need' ? e.item.sourceKey : e.row.sourceKey}#${storedId}`
+  return evMap[sk] || evMap[storedId] || null
+}
+
+function FeedRow({ e, selected, idx, evMap, onSelect }) {
+  const st = FEED_ICON[e.type](e)
+  const ev = feedEvidence(e, evMap)
+  return jsxs('div', {
+    className: cn('hday-feedrow hday-row group flex w-full items-center gap-2 px-2.5 py-1.5', selected && 'hday-sel'),
+    'data-hday-idx': idx,
+    onClick: onSelect,
+    children: [
+      jsx(Codicon, { name: st.icon, className: 'shrink-0 text-[0.78rem]', style: { color: st.color } }),
+      jsxs('div', {
+        className: 'min-w-0 flex-1',
+        children: [
+          jsx('div', { className: 'truncate text-[0.78rem] font-medium', style: { color: C.text }, children: feedTitle(e) }),
+          jsx('div', {
+            className: cn('truncate text-[0.66rem]', e.type === 'need' && e.item.kind === 'approval' && 'font-mono'),
+            style: { color: e.type === 'need' && e.item.kind === 'approval' ? C.mono : C.faint },
+            children: feedSub(e)
+          })
+        ]
+      }),
+      e.type === 'need'
+        ? jsxs('span', {
+            className: 'inline-flex shrink-0 items-center rounded-[3px] px-1 py-px text-[0.6rem] font-semibold',
+            style: { color: st.color, background: `${st.color}1f` },
+            children: (KIND_STYLE[e.item.kind] || KIND_STYLE.other).label
+          })
+        : null,
+      jsx(EvidenceBadge, { ev }),
+      jsx(AgoText, { ms: feedAt(e) })
+    ]
+  })
+}
+
+// session event replay for the inspector's Diff + Trace tabs
+const INSP_QK = ['hday-insp']
+
+async function fetchEventsFor(e) {
+  const runtimeId = e.type === 'finished' ? e.f.runtimeId
+    : e.type === 'need' ? e.item.sessionId
+    : e.row.session.id
+  const route = e.type === 'finished' ? e.f.route
+    : e.type === 'need' ? e.item.route
+    : e.row.route
+  if (!runtimeId) return { events: [], unavailable: true }
+  try {
+    const snap = await rpc(route, 'session.events.since', { session_id: runtimeId, last_seen: 0 })
+    return { events: snap && Array.isArray(snap.events) ? snap.events : [], truncated: snap && snap.truncated }
+  } catch (err) {
+    return { events: [], error: errMsg(err) }
+  }
+}
+
+const evType = e => String(e.type || e.event || '')
+const jsonShort = v => {
+  try {
+    const s = typeof v === 'string' ? v : JSON.stringify(v)
+    return s && s !== '{}' && s !== 'null' ? s.slice(0, 400) : ''
+  } catch {
+    return ''
+  }
+}
+
+function TraceView({ events }) {
+  const rows = []
+  const starts = new Map()
+  for (const e of events) {
+    const t = evType(e)
+    if (t === 'tool.start') starts.set(e.tool_id, e)
+    else if (t === 'tool.complete') {
+      const st = starts.get(e.tool_id)
+      rows.push({
+        key: e.seq || rows.length, name: e.name || 'tool', ok: !(e.error_type || e.error_message),
+        at: e.ts || 0, dur: e.duration_s, args: (st && st.args_text) || e.args_text || jsonShort(e.args),
+        out: e.summary || e.result_text || jsonShort(e.result)
+      })
+    } else if (t === 'message.complete') {
+      rows.push({ key: e.seq || rows.length, name: 'answer', ok: true, at: e.ts || 0, args: '', out: String(e.text || e.final || '').slice(0, 400) })
+    } else if (t === 'status.update' && e.kind === 'process') {
+      rows.push({ key: e.seq || rows.length, name: 'status', ok: true, at: e.ts || 0, args: '', out: e.text || '' })
+    }
+  }
+  if (!rows.length) return jsx('div', { className: 'px-3 py-6 text-[0.72rem]', style: { color: C.faint }, children: 'No tool calls in this session’s replay window.' })
+  return jsx('div', {
+    className: 'flex flex-col px-2 py-1',
+    children: rows.map(r => jsxs('details', {
+      className: 'group border-b py-1.5',
+      style: { borderColor: C.border },
+      children: [
+        jsxs('summary', {
+          className: 'flex cursor-pointer list-none items-center gap-2 text-[0.72rem]',
+          children: [
+            jsx(Codicon, { name: 'chevron-right', className: 'text-[0.7rem] transition-transform group-open:rotate-90', style: { color: C.faint } }),
+            jsx(Codicon, { name: r.ok ? 'check' : 'error', className: 'text-[0.7rem]', style: { color: r.ok ? C.emerald : C.red } }),
+            jsx('span', { className: 'font-mono', style: { color: C.mono }, children: r.name }),
+            r.dur != null ? jsx('span', { className: 'text-[0.62rem]', style: { color: C.faint }, children: `${r.dur.toFixed ? r.dur.toFixed(1) : r.dur}s` }) : null
+          ]
+        }),
+        jsxs('div', {
+          className: 'mt-1.5 flex flex-col gap-1 pl-6',
+          children: [
+            r.args ? jsx('pre', { className: 'overflow-x-auto whitespace-pre-wrap break-all rounded border px-2 py-1.5 font-mono text-[0.66rem]', style: { background: '#0b0c10', borderColor: C.border, color: C.mono }, children: r.args }) : null,
+            r.out ? jsx('pre', { className: 'max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded border px-2 py-1.5 font-mono text-[0.66rem]', style: { background: '#0b0c10', borderColor: C.border, color: C.muted }, children: String(r.out).slice(0, 3000) }) : null
+          ]
+        })
+      ]
+    }, r.key))
+  })
+}
+
+function DiffView({ events }) {
+  const diffs = []
+  for (const e of events) {
+    if (evType(e) === 'tool.complete' && e.inline_diff) {
+      diffs.push({ key: e.seq || diffs.length, name: (e.args && (e.args.path || e.args.file_path)) || e.name || 'file', diff: e.inline_diff })
+    }
+  }
+  if (!diffs.length) return jsx('div', { className: 'px-3 py-6 text-[0.72rem]', style: { color: C.faint }, children: 'No file diffs in this session’s replay window.' })
+  return jsx('div', {
+    className: 'flex flex-col gap-2 p-2',
+    children: diffs.map(d => jsxs('div', {
+      className: 'overflow-hidden rounded border',
+      style: { borderColor: C.border },
+      children: [
+        jsx('div', { className: 'border-b px-2 py-1 font-mono text-[0.66rem]', style: { borderColor: C.border, color: C.muted, background: C.surface }, children: d.name }),
+        jsx('pre', {
+          className: 'max-h-72 overflow-auto p-1 font-mono text-[0.66rem] leading-4',
+          style: { background: '#0b0c10', color: C.muted },
+          children: String(d.diff).split('\n').map((line, i) => jsx('div', {
+            className: line.startsWith('+') ? 'hday-diff-add' : line.startsWith('-') ? 'hday-diff-del' : line.startsWith('@@') ? 'hday-diff-hunk' : '',
+            children: line || ' '
+          }, i))
+        })
+      ]
+    }, d.key))
+  })
+}
+
+function EvidenceView({ ev }) {
+  if (!ev) return jsx('div', { className: 'px-3 py-6 text-[0.72rem]', style: { color: C.faint }, children: 'No evidence-gate record for this session.' })
+  return jsxs('div', {
+    className: 'flex flex-col gap-3 p-3',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-2',
+        children: [jsx(EvidenceBadge, { ev }), jsx('span', { className: 'text-[0.72rem]', style: { color: C.muted }, children: ev.detail || '' })]
+      }),
+      ev.run_list && ev.run_list.length
+        ? jsxs('div', {
+            children: [
+              jsx('div', { className: 'mb-1 text-[0.62rem] font-semibold uppercase tracking-wider', style: { color: C.faint }, children: 'Check runs' }),
+              jsx('div', {
+                className: 'flex flex-col gap-0.5',
+                children: ev.run_list.map((r, i) => jsxs('div', {
+                  className: 'flex items-center gap-2 font-mono text-[0.66rem]',
+                  children: [
+                    jsx('span', { style: { color: r.ok ? C.emerald : C.red }, children: `exit ${r.exit ?? '?'}` }),
+                    jsx('span', { className: 'truncate', style: { color: C.mono }, children: r.cmd }),
+                    jsx('span', { className: 'ml-auto shrink-0', style: { color: C.faint }, children: r.ts ? relativeTime(r.ts * 1000) : '' })
+                  ]
+                }, i))
+              })
+            ]
+          })
+        : null,
+      ev.block_list && ev.block_list.length
+        ? jsxs('div', {
+            children: [
+              jsx('div', { className: 'mb-1 text-[0.62rem] font-semibold uppercase tracking-wider', style: { color: C.red }, children: 'Honesty guard blocks' }),
+              jsx('div', {
+                className: 'flex flex-col gap-0.5',
+                children: ev.block_list.map((b, i) => jsxs('div', {
+                  className: 'flex items-center gap-2 text-[0.66rem]',
+                  children: [
+                    jsx(Codicon, { name: 'shield', className: 'text-[0.66rem]', style: { color: C.red } }),
+                    jsx('span', { style: { color: C.muted }, children: `${b.tool} — ${b.reason}` }),
+                    jsx('span', { className: 'ml-auto shrink-0', style: { color: C.faint }, children: b.ts ? relativeTime(b.ts * 1000) : '' })
+                  ]
+                }, i))
+              })
+            ]
+          })
+        : null,
+      ev.files && ev.files.length
+        ? jsxs('div', {
+            children: [
+              jsx('div', { className: 'mb-1 text-[0.62rem] font-semibold uppercase tracking-wider', style: { color: C.faint }, children: 'Files touched' }),
+              jsx('div', {
+                className: 'flex flex-col gap-0.5',
+                children: ev.files.map((f, i) => jsx('div', { className: 'truncate font-mono text-[0.66rem]', style: { color: C.muted }, children: f }, i))
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function NeedInspectorBody({ item }) {
+  const [busy, setBusy] = useState('')
+  const [failed, setFailed] = useState('')
+  const run = useCallback(async (tag, fn) => {
+    setBusy(tag)
+    setFailed('')
+    try {
+      await fn()
+      haptic('submit')
+      invalidate()
+    } catch (err) {
+      setFailed(errMsg(err))
+      haptic('cancel')
+    } finally {
+      setBusy('')
+    }
+  }, [item])
+  const open = () => run('open', () => openItemSession(item))
+  const body = item.kind === 'approval'
+    ? jsx(ApprovalBody, { item, busy, run, open })
+    : item.kind === 'clarify'
+      ? jsx(ClarifyBody, { item, busy, run, open })
+      : jsx(GenericRequestBody, { item, busy, open })
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 p-3',
+    children: [body, failed ? jsx('div', { className: 'text-[0.68rem]', style: { color: C.red }, children: failed }) : null]
+  })
+}
+
+function SessInspectorBody({ e }) {
+  // details/actions for waiting, in-flight and finished feed entries
+  const [busy, setBusy] = useState('')
+  const [nudging, setNudging] = useState(false)
+  const [nudgeText, setNudgeText] = useState('')
+  const [note, setNote] = useState('')
+  const pinnedMap = useValue($pinned)
+  const sess = e.type === 'finished' ? null : e.row.session
+  const f = e.type === 'finished' ? e.f : null
+  const storedId = sess ? sess.session_key : f.storedId
+  const runtimeId = sess ? sess.id : f.runtimeId
+  const route = sess ? e.row.route : f.route
+  const title = sess ? sess.title : f.title
+  const pinned = Boolean(storedId && pinnedMap[storedId])
+
+  const act = async (tag, fn) => {
+    setBusy(tag)
+    try {
+      await fn()
+      haptic('submit')
+      invalidate()
+    } catch {
+      haptic('cancel')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-3 p-3',
+    children: [
+      jsxs('div', {
+        className: 'flex flex-col gap-1',
+        children: [
+          jsx('div', { className: 'text-[0.82rem] font-semibold', style: { color: C.text }, children: title || 'Session' }),
+          jsx('div', {
+            className: 'text-[0.68rem]',
+            style: { color: C.faint },
+            children: sess
+              ? `${sess.status || 'unknown'} · ${sess.model || ''} · ${sess.message_count ?? 0} messages`
+              : f.kind === 'error' ? 'Ended with an error' : 'Turn finished'
+          }),
+          sess && sess.preview
+            ? jsx('div', { className: 'mt-1 line-clamp-3 text-[0.72rem]', style: { color: C.muted }, children: sess.preview })
+            : null
+        ]
+      }),
+      jsxs('div', {
+        className: 'flex flex-wrap items-center gap-1.5',
+        children: [
+          jsx(Button, {
+            size: 'xs', variant: 'default', disabled: Boolean(busy),
+            onClick: () => act('open', () => sess
+              ? openItemSession({ storedId, sessionId: runtimeId, route })
+              : host.openSession(storedId, { ...(route ? { route, profile: route.targetProfile } : {}), awaitHydration: true })),
+            children: busy === 'open' ? spinIcon('sync') : 'Open session'
+          }),
+          storedId
+            ? jsx(Button, {
+                size: 'xs', variant: 'outline', disabled: Boolean(busy),
+                onClick: () => act('pin', () => togglePin(storedId, { title, route })),
+                children: pinned ? 'Unpin' : 'Pin to Watching'
+              })
+            : null,
+          runtimeId
+            ? jsx(Button, {
+                size: 'xs', variant: 'outline',
+                onClick: () => setNudging(v => !v),
+                children: 'Follow up'
+              })
+            : null,
+          sess && e.type === 'flight'
+            ? jsx(Button, {
+                size: 'xs', variant: 'outline', disabled: Boolean(busy),
+                onClick: () => act('stop', () => interruptSession(route, runtimeId)),
+                children: 'Stop'
+              })
+            : null,
+          f
+            ? jsx(Button, {
+                size: 'xs', variant: 'ghost', disabled: Boolean(busy),
+                onClick: () => act('dismiss', () => dismissFinished(f.key)),
+                children: 'Dismiss'
+              })
+            : null
+        ]
+      }),
+      nudging && runtimeId
+        ? jsxs('div', {
+            className: 'flex items-center gap-1.5',
+            children: [
+              jsx(Input, {
+                value: nudgeText,
+                placeholder: 'Follow up — resumes this session…',
+                onChange: ev => setNudgeText(ev.target.value),
+                onKeyDown: ev => {
+                  ev.stopPropagation()
+                  if (isSubmitEnter(ev) && nudgeText.trim()) {
+                    act('nudge', async () => {
+                      await nudgeSession(route, runtimeId, nudgeText.trim())
+                      setNudgeText('')
+                      setNudging(false)
+                      setNote('Sent — session resumed')
+                    })
+                  }
+                },
+                className: 'h-7 flex-1 text-[0.78rem]'
+              }),
+              jsx(Button, {
+                size: 'xs', variant: 'secondary', disabled: !nudgeText.trim() || Boolean(busy),
+                onClick: () => act('nudge', async () => {
+                  await nudgeSession(route, runtimeId, nudgeText.trim())
+                  setNudgeText('')
+                  setNudging(false)
+                  setNote('Sent — session resumed')
+                }),
+                children: 'Send'
+              })
+            ]
+          })
+        : null,
+      note ? jsx('div', { className: 'text-[0.68rem]', style: { color: C.emerald }, children: note }) : null
+    ]
+  })
+}
+
+const INSP_TABS = [['details', 'Details'], ['evidence', 'Evidence'], ['diff', 'Diff'], ['trace', 'Trace']]
+
+function Inspector({ e, evMap }) {
+  const [tab, setTab] = useState('details')
+  const selKey = e ? e.key : ''
+  const isSessionish = e && e.type !== 'need'
+  const runtimeId = !e ? null : e.type === 'finished' ? e.f.runtimeId : e.type === 'need' ? e.item.sessionId : e.row.session.id
+  const route = !e ? null : e.type === 'finished' ? e.f.route : e.type === 'need' ? e.item.route : e.row.route
+  const eventsQ = useQuery({
+    queryKey: [...INSP_QK, selKey],
+    queryFn: () => fetchEventsFor(e),
+    enabled: Boolean(e),
+    refetchInterval: 3000,
+    staleTime: 1200
+  })
+  const ev = e ? feedEvidence(e, evMap) : null
+
+  useEffect(() => {
+    setTab('details')
+  }, [selKey])
+
+  if (!e) {
+    return jsxs('div', {
+      className: 'flex h-full flex-col items-center justify-center gap-2',
+      children: [
+        jsx(Codicon, { name: 'inspect', className: 'text-2xl', style: { color: C.faint } }),
+        jsx('div', { className: 'text-[0.78rem]', style: { color: C.muted }, children: 'Select a row to inspect it' }),
+        jsxs('div', {
+          className: 'flex items-center gap-2 text-[0.66rem]',
+          style: { color: C.faint },
+          children: [jsx(Kbd, { children: 'j/k' }), 'move', jsx('span', { children: '·' }), jsx(Kbd, { children: 'o' }), 'open session']
+        })
+      ]
+    })
+  }
+
+  const title = feedTitle(e)
+  const st = FEED_ICON[e.type](e)
+  const events = (eventsQ.data && eventsQ.data.events) || []
+  const tabs = INSP_TABS.filter(([k]) => k !== 'evidence' || Boolean(ev))
+
+  return jsxs('div', {
+    className: 'flex h-full min-h-0 flex-col',
+    children: [
+      jsxs('div', {
+        className: 'flex shrink-0 items-center gap-2 px-3 py-2',
+        style: { borderBottom: `1px solid ${C.border}` },
+        children: [
+          jsx(Codicon, { name: st.icon, className: 'text-[0.8rem]', style: { color: st.color } }),
+          jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.82rem] font-semibold', style: { color: C.text }, children: title }),
+          jsx(AgoText, { ms: feedAt(e) }),
+          jsx(Button, {
+            size: 'xs', variant: 'outline',
+            onClick: () => {
+              if (e.type === 'need') openItemSession(e.item).catch(() => {})
+              else if (e.type === 'finished') {
+                if (e.f.storedId) host.openSession(e.f.storedId, { ...(e.f.route ? { route: e.f.route, profile: e.f.route.targetProfile } : {}), awaitHydration: true }).catch(() => {})
+              } else openItemSession({ storedId: e.row.session.session_key, sessionId: e.row.session.id, route: e.row.route }).catch(() => {})
+            },
+            children: 'Open'
+          })
+        ]
+      }),
+      jsxs('div', {
+        className: 'flex shrink-0 items-center gap-3 px-3 pt-1',
+        children: tabs.map(([k, label]) => jsx('button', {
+          className: cn('hday-tab px-0.5 py-1.5 text-[0.68rem] font-medium', tab === k && 'hday-tab-on'),
+          style: { color: tab === k ? C.text : C.faint },
+          onClick: () => { setTab(k); haptic('selection') },
+          children: label
+        }, k))
+      }),
+      jsx(ScrollArea, {
+        className: 'min-h-0 flex-1',
+        children: tab === 'details'
+          ? e.type === 'need'
+            ? jsx(NeedInspectorBody, { item: e.item })
+            : jsx(SessInspectorBody, { e })
+          : tab === 'evidence'
+            ? jsx(EvidenceView, { ev })
+            : tab === 'diff'
+              ? jsx(DiffView, { events })
+              : jsx(TraceView, { events })
+      }),
+      eventsQ.data && eventsQ.data.truncated
+        ? jsx('div', { className: 'shrink-0 px-3 py-1 text-[0.62rem]', style: { color: C.faint, borderTop: `1px solid ${C.border}` }, children: 'replay window truncated — open the session for the full history' })
+        : null
+    ]
+  })
+}
+
 function DayPage() {
   ensureDayStyles()
   const scan = useQuery({ queryKey: SCAN_QK, queryFn: scanInbox, refetchInterval: 5000, staleTime: 1500, refetchOnWindowFocus: true })
@@ -1753,11 +2267,21 @@ function DayPage() {
   const mutedMap = useValue($muted)
   const prefs = useValue($prefs)
   const watching = Object.values(pinnedMap).sort((a, b) => b.at - a.at)
+  const evMap = useValue($evidence)
 
-  // clamp keyboard selection to the visible queue
+  // unified action feed — needs, waiting, in-flight, finished in triage order
+  const feed = []
+  for (const n of needs) feed.push({ type: 'need', key: `need:${n.key}`, item: n })
+  if (!focus) for (const r of waiting) feed.push({ type: 'waiting', key: `sess:${r.sourceKey}#${r.session.id}`, row: r })
+  for (const r of flight) feed.push({ type: 'flight', key: `sess:${r.sourceKey}#${r.session.id}`, row: r })
+  if (!focus) for (const f of finished) feed.push({ type: 'finished', key: `fin:${f.key}`, f })
+  const feedIndex = new Map(feed.map((e, i) => [e.key, i]))
+  const selEntry = feed[sel] || null
+
+  // clamp keyboard selection to the visible feed
   useEffect(() => {
-    if (sel >= needs.length) setSel(Math.max(0, needs.length - 1))
-  }, [needs.length])
+    if (sel >= feed.length) setSel(Math.max(0, feed.length - 1))
+  }, [feed.length])
 
   // inbox-zero confetti — only on a real transition, never on first paint
   useEffect(() => {
@@ -1775,28 +2299,37 @@ function DayPage() {
       const t = ev.target
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return
-      const item = needs[sel]
+      const entry = feed[sel]
       if (ev.key === 'j' || ev.key === 'ArrowDown') {
-        setSel(s => Math.min(needs.length - 1, s + 1))
+        setSel(s => Math.min(feed.length - 1, s + 1))
         ev.preventDefault()
       } else if (ev.key === 'k' || ev.key === 'ArrowUp') {
         setSel(s => Math.max(0, s - 1))
         ev.preventDefault()
-      } else if (!item) return
-      else if (ev.key === 'a' && item.kind === 'approval') {
-        respondApproval(item, 'once').then(invalidate).catch(() => {})
-      } else if (ev.key === 'd' && item.kind === 'approval') {
-        respondApproval(item, 'deny').then(invalidate).catch(() => {})
-      } else if (ev.key === 's') {
-        snoozeRequest(item.requestId)
+      } else if (!entry) return
+      else if (entry.type === 'need' && ev.key === 'a' && entry.item.kind === 'approval') {
+        respondApproval(entry.item, 'once').then(invalidate).catch(() => {})
+      } else if (entry.type === 'need' && ev.key === 'd' && entry.item.kind === 'approval') {
+        respondApproval(entry.item, 'deny').then(invalidate).catch(() => {})
+      } else if (entry.type === 'need' && ev.key === 's') {
+        snoozeRequest(entry.item.requestId)
       } else if (ev.key === 'o' || ev.key === 'Enter') {
-        openItemSession(item).catch(() => {})
+        if (entry.type === 'need') openItemSession(entry.item).catch(() => {})
+        else if (entry.type === 'finished') {
+          if (entry.f.storedId) host.openSession(entry.f.storedId, {}).catch(() => {})
+        } else openItemSession({ storedId: entry.row.session.session_key, sessionId: entry.row.session.id, route: entry.row.route }).catch(() => {})
       } else return
       haptic('selection')
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [needs, sel])
+  }, [feed, sel])
+
+  // keep the selected feed row scrolled into view
+  useEffect(() => {
+    const el = document.querySelector(`[data-hday-idx="${sel}"]`)
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' })
+  }, [sel])
 
   // group approvals by session for the resolve-all bar
   const approvalsBySession = {}
@@ -1813,6 +2346,19 @@ function DayPage() {
 
   const empty =
     data && needs.length === 0 && flight.length === 0 && waiting.length === 0 && finished.length === 0 && jobs.length === 0
+
+  const feedSection = (id, icon, title, count, color, type, extra) =>
+    jsxs('section', {
+      id,
+      children: [
+        jsx(SectionLabel, { icon, title, count, color, action: extra }),
+        jsx('div', {
+          className: 'flex flex-col',
+          children: feed.filter(e => e.type === type).map(e =>
+            jsx(FeedRow, { e, idx: feedIndex.get(e.key), selected: feedIndex.get(e.key) === sel, evMap, onSelect: () => setSel(feedIndex.get(e.key) ?? 0) }, e.key))
+        })
+      ]
+    })
 
   return jsxs('div', {
     className: 'hday-root flex h-full min-h-0 flex-col',
@@ -1908,118 +2454,88 @@ function DayPage() {
         ]
       }),
       jsxs('div', {
-        className: 'mx-auto w-full max-w-6xl shrink-0 px-6 pt-4',
+        className: 'flex min-h-0 flex-1',
         children: [
-          jsxs('div', {
-            className: 'mb-3 grid grid-cols-2 gap-2 md:grid-cols-4',
+          // LEFT — the action feed
+          jsxs('section', {
+            className: 'flex w-[38%] min-w-[300px] max-w-[480px] shrink-0 flex-col',
+            style: { borderRight: `1px solid ${C.border}` },
             children: [
-              jsx(StatTile, { icon: 'bell-dot', label: 'Waiting on you', n: needs.length, color: '#f59e0b', scrollTo: 'hday-needs' }),
-              jsx(StatTile, { icon: 'rocket', label: 'In flight', n: flight.length, color: '#58a6ff', scrollTo: 'hday-flight' }),
-              jsx(StatTile, { icon: 'pass', label: 'To review', n: finished.length, color: '#34d399', scrollTo: 'hday-finished' }),
-              jsx(StatTile, { icon: 'calendar', label: 'Scheduled', n: jobs.length, color: '#a855f7', scrollTo: 'hday-sched' })
-            ]
-          }),
-          jsx(QuickTaskBar, {}),
-          jsxs('div', {
-            className: 'mt-2 flex items-center gap-3 px-1',
-            children: [
-              jsx(SearchField, {
-                placeholder: 'Filter the board…',
-                value: filter,
-                onChange: setFilter,
-                containerClassName: 'w-56'
-              }),
-              needs.length
-                ? jsxs('span', {
-                    className: 'hidden items-center gap-2 text-[0.65rem] text-muted-foreground/70 lg:flex',
+              jsxs('div', {
+                className: 'shrink-0 px-3 pt-3',
+                children: [
+                  jsxs('div', {
+                    className: 'mb-2 grid grid-cols-2 gap-1.5 xl:grid-cols-4',
                     children: [
-                      jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'j/k' }), 'select'] }),
-                      jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'a' }), 'allow'] }),
-                      jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'd' }), 'deny'] }),
-                      jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 's' }), 'snooze'] }),
-                      jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'o' }), 'open'] })
+                      jsx(StatTile, { icon: 'bell-dot', label: 'Waiting', n: needs.length, color: '#f59e0b', scrollTo: 'hday-needs' }),
+                      jsx(StatTile, { icon: 'rocket', label: 'In flight', n: flight.length, color: '#58a6ff', scrollTo: 'hday-flight' }),
+                      jsx(StatTile, { icon: 'pass', label: 'Review', n: finished.length, color: '#34d399', scrollTo: 'hday-finished' }),
+                      jsx(StatTile, { icon: 'calendar', label: 'Scheduled', n: jobs.length, color: '#a855f7', scrollTo: 'hday-sched' })
+                    ]
+                  }),
+                  jsx(QuickTaskBar, {}),
+                  jsxs('div', {
+                    className: 'mt-2 flex items-center gap-3 px-1 pb-1',
+                    children: [
+                      jsx(SearchField, {
+                        placeholder: 'Filter…',
+                        value: filter,
+                        onChange: setFilter,
+                        containerClassName: 'w-40'
+                      }),
+                      jsxs('span', {
+                        className: 'hidden items-center gap-2 text-[0.62rem] text-muted-foreground/70 xl:flex',
+                        children: [
+                          jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'j/k' }), 'move'] }),
+                          jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'a' }), 'allow'] }),
+                          jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'd' }), 'deny'] }),
+                          jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 's' }), 'snooze'] }),
+                          jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'o' }), 'open'] })
+                        ]
+                      })
                     ]
                   })
-                : null
-            ]
-          })
-        ]
-      }),
-      jsx(ScrollArea, {
-        className: 'min-h-0 flex-1',
-        children: jsxs('div', {
-          className: 'mx-auto grid w-full max-w-6xl grid-cols-1 gap-x-8 gap-y-6 px-6 py-5 xl:grid-cols-[minmax(0,1fr)_320px]',
-          children: [
-            jsxs('main', {
-              className: 'flex min-w-0 flex-col gap-6',
-              children: [
-                scan.isLoading
-                  ? jsxs('div', {
-                      className: 'flex items-center gap-2 py-8 text-muted-foreground',
-                      children: [jsx(Loader, {}), jsx('span', { className: 'text-[0.8rem]', children: 'Scanning every profile and connection…' })]
-                    })
-                  : null,
-                scan.isError
-                  ? jsx(ErrorState, { title: 'Scan failed', description: errMsg(scan.error) })
-                  : null,
-                needs.length
-                  ? jsxs('section', {
-                      id: 'hday-needs',
-                      children: [
-                        jsx(SectionLabel, { icon: 'bell-dot', title: 'Needs you', count: needs.length, color: '#f59e0b' }),
-                        floodSessions.length
-                          ? jsx('div', {
-                              className: 'mb-2 flex flex-col gap-1.5',
-                              children: floodSessions.map(([sid, items]) =>
-                                jsx(ApproveAllBar, { sessionId: sid, title: items[0].title, items }, `flood-${sid}`)
-                              )
-                            })
-                          : null,
-                        jsx('div', {
-                          className: 'flex flex-col gap-2.5',
-                          children: needs.map((item, i) => jsx(NeedsYouCard, { item, selected: i === sel, longest: i === 0 && needs.length > 1 }, item.key))
-                        }),
-                        hiddenCount
-                          ? jsxs('div', {
-                              className: 'mt-2 px-1 text-[0.68rem] text-muted-foreground/60',
-                              children: [`${hiddenCount} item${hiddenCount === 1 ? '' : 's'} snoozed or from muted sources`]
-                            })
-                          : null
-                      ]
-                    })
-                  : hiddenCount
-                    ? jsxs('div', {
-                        className: 'px-1 text-[0.68rem] text-muted-foreground/60',
-                        children: [`${hiddenCount} item${hiddenCount === 1 ? '' : 's'} snoozed or from muted sources`]
-                      })
-                    : null,
-                !focus && waiting.length
-                  ? jsxs('section', {
-                      children: [
-                        jsx(SectionLabel, { icon: 'watch', title: 'Waiting on input', count: waiting.length, color: '#f59e0b' }),
-                        jsx('div', { className: 'flex flex-col', children: waiting.map(r => jsx(FlightRow, { row: r }, `${r.sourceKey}#${r.session.id}`)) })
-                      ]
-                    })
-                  : null,
-                flight.length
-                  ? jsxs('section', {
-                      id: 'hday-flight',
-                      children: [
-                        jsx(SectionLabel, { icon: 'rocket', title: 'In flight', count: flight.length, color: '#58a6ff' }),
-                        jsx('div', { className: 'flex flex-col', children: flight.map(r => jsx(FlightRow, { row: r }, `${r.sourceKey}#${r.session.id}`)) })
-                      ]
-                    })
-                  : null,
-                !focus && finished.length
-                  ? jsxs('section', {
-                      id: 'hday-finished',
-                      children: [
-                        jsx(SectionLabel, {
-                          icon: 'pass',
-                          title: 'Finished — review',
-                          count: finished.length,
-                          color: '#34d399',
-                          action: jsx(Button, {
+                ]
+              }),
+              jsx(ScrollArea, {
+                className: 'min-h-0 flex-1',
+                children: jsxs('div', {
+                  className: 'flex flex-col gap-4 px-1 py-2',
+                  children: [
+                    scan.isLoading
+                      ? jsxs('div', {
+                          className: 'flex items-center gap-2 py-8 text-muted-foreground',
+                          children: [jsx(Loader, {}), jsx('span', { className: 'text-[0.8rem]', children: 'Scanning…' })]
+                        })
+                      : null,
+                    scan.isError ? jsx(ErrorState, { title: 'Scan failed', description: errMsg(scan.error) }) : null,
+                    needs.length
+                      ? jsxs('div', {
+                          children: [
+                            feedSection('hday-needs', 'bell-dot', 'Needs you', needs.length, '#f59e0b', 'need',
+                              floodSessions.length
+                                ? jsx('span', {
+                                    className: 'text-[0.62rem]',
+                                    style: { color: C.amber },
+                                    children: `${floodSessions.length} flood`
+                                  })
+                                : null),
+                            floodSessions.length
+                              ? jsx('div', {
+                                  className: 'mb-2 flex flex-col gap-1.5',
+                                  children: floodSessions.map(([sid, items]) =>
+                                    jsx(ApproveAllBar, { sessionId: sid, title: items[0].title, items }, `flood-${sid}`)
+                                  )
+                                })
+                              : null
+                          ]
+                        })
+                      : null,
+                    waiting.length ? feedSection(null, 'watch', 'Waiting on input', waiting.length, '#f59e0b', 'waiting') : null,
+                    flight.length ? feedSection('hday-flight', 'rocket', 'In flight', flight.length, '#34d399', 'flight') : null,
+                    finished.length
+                      ? feedSection('hday-finished', 'pass', 'Finished — review', finished.length, '#34d399', 'finished',
+                          jsx(Button, {
                             size: 'xs',
                             variant: 'ghost',
                             className: 'h-5 px-1.5 text-[0.62rem] text-muted-foreground',
@@ -2030,109 +2546,101 @@ function DayPage() {
                               haptic('selection')
                             },
                             children: 'Clear all'
-                          })
-                        }),
-                        jsx('div', { className: 'flex flex-col', children: finished.map(f => jsx(FinishedRow, { f }, f.key)) })
-                      ]
-                    })
-                  : null,
-                empty
-                  ? jsxs('div', {
-                      className: 'flex flex-col items-center gap-3 py-16 text-center',
-                      children: [
-                        jsxs('svg', {
-                          width: 120,
-                          height: 64,
-                          viewBox: '0 0 120 64',
-                          'aria-hidden': true,
-                          children: [
-                            jsx('circle', { cx: 60, cy: 44, r: 14, fill: '#f59e0b', fillOpacity: 0.9 }),
-                            jsx('line', { x1: 60, y1: 14, x2: 60, y2: 24, stroke: '#f59e0b', strokeWidth: 2, strokeLinecap: 'round' }),
-                            jsx('line', { x1: 36, y1: 26, x2: 43, y2: 33, stroke: '#f59e0b', strokeWidth: 2, strokeLinecap: 'round' }),
-                            jsx('line', { x1: 84, y1: 26, x2: 77, y2: 33, stroke: '#f59e0b', strokeWidth: 2, strokeLinecap: 'round' }),
-                            jsx('line', { x1: 20, y1: 44, x2: 32, y2: 44, stroke: '#f59e0b', strokeWidth: 2, strokeLinecap: 'round' }),
-                            jsx('line', { x1: 88, y1: 44, x2: 100, y2: 44, stroke: '#f59e0b', strokeWidth: 2, strokeLinecap: 'round' }),
-                            jsx('line', { x1: 8, y1: 56, x2: 112, y2: 56, stroke: 'var(--ui-stroke-secondary)', strokeWidth: 2, strokeLinecap: 'round' })
-                          ]
-                        }),
-                        jsx('div', { className: 'text-[0.85rem] font-medium text-(--ui-text-primary)', children: 'Nothing on the board' }),
-                        jsx('div', {
-                          className: 'max-w-sm text-[0.75rem] leading-5 text-muted-foreground',
-                          children: 'No approvals waiting, nothing running, nothing scheduled. Hermes is idle — start something up top and run the whole day from here.'
+                          }))
+                      : null,
+                    hiddenCount
+                      ? jsxs('div', {
+                          className: 'px-2 text-[0.68rem] text-muted-foreground/60',
+                          children: [`${hiddenCount} item${hiddenCount === 1 ? '' : 's'} snoozed or muted`]
                         })
-                      ]
-                    })
-                  : null
-              ]
-            }),
-            !focus
-              ? jsxs('aside', {
-                  className: 'flex min-w-0 flex-col gap-6 xl:border-l xl:border-(--ui-stroke-secondary) xl:pl-8',
-                  children: [
-                watching.length
-                  ? jsxs('section', {
-                      children: [
-                        jsx(SectionLabel, { icon: 'pinned', title: 'Watching', count: watching.length, color: '#58a6ff' }),
-                        jsx('div', { className: 'flex flex-col', children: watching.map(w => jsx(WatchingRow, { entry: w }, w.storedId)) })
-                      ]
-                    })
-                  : null,
-                jsxs('section', {
-                  id: 'hday-sched',
-                  children: [
-                    jsx(SectionLabel, { icon: 'calendar', title: 'Scheduled', count: jobs.length, color: '#a855f7' }),
-                    jobs.length
-                      ? jsx('div', { className: 'flex flex-col', children: jobs.slice(0, 20).map(j2 => jsx(CronRow, { entry: j2 }, j2.key)) })
-                      : jsx('div', { className: 'px-2 py-3 text-[0.72rem] text-muted-foreground', children: 'No scheduled jobs.' })
-                  ]
-                }),
-                jsxs('section', {
-                  children: [
-                    jsx(SectionLabel, { icon: 'server-environment', title: 'Sources', count: sources.length }),
-                    jsx('div', {
-                      className: 'flex flex-col gap-1',
-                      children: sources.map(s => {
-                        const muted = Boolean(mutedMap[s.key])
-                        return jsxs(
-                          'div',
-                          {
-                            className: cn('flex items-center gap-2 px-2 py-1 text-[0.72rem]', muted && 'opacity-50'),
-                            children: [
-                              jsx('span', {
-                                className: cn('size-1.5 rounded-full', s.unreachable ? 'bg-destructive' : 'bg-emerald-500')
-                              }),
-                              jsx('span', { className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)', children: s.label }),
-                              s.unreachable ? jsx(Tip, { label: s.unreachable, children: jsx(Codicon, { name: 'warning', className: 'text-amber-500' }) }) : null,
-                              jsx(Tip, {
-                                label: muted ? 'Unmute — show its waiting items again' : 'Mute — hide its waiting items',
-                                children: jsx(Button, {
-                                  size: 'icon-xs',
-                                  variant: 'ghost',
-                                  onClick: () => {
-                                    toggleMute(s.key)
-                                    invalidate()
+                      : null,
+                    empty
+                      ? jsxs('div', {
+                          className: 'flex flex-col items-center gap-3 py-12 text-center',
+                          children: [
+                            jsx('div', { className: 'text-[0.85rem] font-medium', style: { color: C.text }, children: 'Nothing on the board' }),
+                            jsx('div', {
+                              className: 'max-w-xs text-[0.72rem] leading-5 text-muted-foreground',
+                              children: 'No approvals waiting, nothing running, nothing scheduled. Start something up top and run the whole day from here.'
+                            })
+                          ]
+                        })
+                      : null,
+                    !focus && watching.length
+                      ? jsxs('section', {
+                          children: [
+                            jsx(SectionLabel, { icon: 'pinned', title: 'Watching', count: watching.length, color: '#58a6ff' }),
+                            jsx('div', { className: 'flex flex-col', children: watching.map(w => jsx(WatchingRow, { entry: w }, w.storedId)) })
+                          ]
+                        })
+                      : null,
+                    !focus
+                      ? jsxs('section', {
+                          id: 'hday-sched',
+                          children: [
+                            jsx(SectionLabel, { icon: 'calendar', title: 'Scheduled', count: jobs.length, color: '#a855f7' }),
+                            jobs.length
+                              ? jsx('div', { className: 'flex flex-col', children: jobs.slice(0, 20).map(j2 => jsx(CronRow, { entry: j2 }, j2.key)) })
+                              : jsx('div', { className: 'px-2 py-2 text-[0.72rem] text-muted-foreground', children: 'No scheduled jobs.' })
+                          ]
+                        })
+                      : null,
+                    !focus
+                      ? jsxs('section', {
+                          children: [
+                            jsx(SectionLabel, { icon: 'server-environment', title: 'Sources', count: sources.length }),
+                            jsx('div', {
+                              className: 'flex flex-col gap-1',
+                              children: sources.map(s => {
+                                const muted = Boolean(mutedMap[s.key])
+                                return jsxs(
+                                  'div',
+                                  {
+                                    className: cn('flex items-center gap-2 px-2 py-1 text-[0.72rem]', muted && 'opacity-50'),
+                                    children: [
+                                      jsx('span', {
+                                        className: cn('size-1.5 rounded-full', s.unreachable ? 'bg-destructive' : 'bg-emerald-500')
+                                      }),
+                                      jsx('span', { className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)', children: s.label }),
+                                      s.unreachable ? jsx(Tip, { label: s.unreachable, children: jsx(Codicon, { name: 'warning', className: 'text-amber-500' }) }) : null,
+                                      jsx(Tip, {
+                                        label: muted ? 'Unmute' : 'Mute source',
+                                        children: jsx(Button, {
+                                          size: 'icon-xs',
+                                          variant: 'ghost',
+                                          onClick: () => {
+                                            toggleMute(s.key)
+                                            invalidate()
+                                          },
+                                          children: jsx(Codicon, { name: muted ? 'bell-slash' : 'bell' })
+                                        })
+                                      })
+                                    ]
                                   },
-                                  children: jsx(Codicon, { name: muted ? 'bell-slash' : 'bell' })
-                                })
+                                  s.key
+                                )
                               })
-                            ]
-                          },
-                          s.key
-                        )
-                      })
+                            })
+                          ]
+                        })
+                      : null,
+                    jsx('div', {
+                      className: 'px-2 pt-2 text-[0.68rem]',
+                      style: { borderTop: `1px solid ${C.border}`, color: C.faint },
+                      children: `Today · ${finishedAll.filter(f => Date.now() - f.at < 24 * 60 * 60 * 1000).length} finished · ${triageToday()} triaged`
                     })
                   ]
-                }),
-                jsx('div', {
-                  className: 'px-2 pt-3 text-[0.68rem]',
-                  style: { borderTop: `1px solid ${C.border}`, color: C.faint },
-                  children: `Today · ${finishedAll.filter(f => Date.now() - f.at < 24 * 60 * 60 * 1000).length} finished · ${triageToday()} triaged`
                 })
-              ]
-            })
-              : null
-          ]
-        })
+              })
+            ]
+          }),
+          // RIGHT — the live inspector
+          jsxs('section', {
+            className: 'flex min-w-0 flex-1 flex-col',
+            style: { background: '#0e1117' },
+            children: [jsx(Inspector, { e: selEntry, evMap })]
+          })
+        ]
       }),
       undo
         ? jsxs('div', {
