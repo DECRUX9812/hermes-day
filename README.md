@@ -16,9 +16,14 @@ Hermes Day is a full-screen desktop plugin for [Hermes Agent](https://github.com
 | **Sources** | Health of every profile/connection the inbox is scanning — with a per-source mute bell for the noisy ones. |
 | **Watching** | Pin any session to keep it on the rail — running or finished — until you unpin it. |
 
-The header carries a live **day arc** (a sun tracking 6 am–6 pm), a stats strip
-(waiting / in flight / to review / triaged-today), and the next scheduled
-job's countdown. The rail ends with a digest line: today, finished, triaged.
+The header carries a live **day arc** (a sun tracking 6 am–6 pm), a time-of-day
+tint, and a stat strip. Below it, four **clickable stat tiles** — waiting,
+in flight, to review, scheduled — scroll you to their section. The rail ends
+with a digest line: today, finished, triaged.
+
+Cards are **kind-tinted** (a subtle gradient keyed to approval / question /
+input), lift on hover, and commands render in a dark terminal block — the board
+reads like a cockpit, not a list.
 
 **Focus mode** (eye icon) collapses everything except what's waiting on you and
 what's running — the rail, the review queue, and the waiting section fold away.
@@ -46,6 +51,8 @@ nags you where your attention is most overdue.
 ## Stay in flow
 
 - **Quick-task bar** — type what you want done, hit Enter: the plugin creates the session and submits the prompt without leaving the board.
+- **Saved prompt presets** — one-click chips under the bar (defaults included); add your own with “save a prompt”, remove with ×.
+- **Clear all reviewed** — one button empties the review queue.
 - **Desktop notifications** — new needs announce themselves via the OS (bell toggle in the header; the first scan never fires — no notification storm on launch).
 - **Snooze & mute** — snooze a card for 15 minutes, or mute a whole source; hidden items stay out of the counts until they're due.
 - **Flood bar** — when one session stacks up multiple approvals, a single "Allow all" bar clears them in one click via `approval.respond { all: true }`.

@@ -110,6 +110,8 @@ const $prefs = atom({ notify: true })
 const $pinned = atom({})
 /** daily triage counter — { date: 'YYYY-MM-DD', count } */
 const $triage = atom({ date: '', count: 0 })
+/** saved quick-prompt presets under the task bar */
+const $prompts = atom(null)
 /** last dismissed finished item — powers the undo chip */
 const $undo = atom(null)
 /** sessionKey -> recent latest_seq samples — the in-flight heartbeat */
@@ -128,6 +130,8 @@ const SNOOZE_KEY = 'snoozed.v1'
 const PREFS_KEY = 'prefs.v1'
 const PINNED_KEY = 'pinned.v1'
 const TRIAGE_KEY = 'triage.v1'
+const PROMPTS_KEY = 'prompts.v1'
+const DEFAULT_PROMPTS = ['Summarize overnight logs', 'Review my open PRs', 'Check cron results']
 
 let stylesInjected = false
 function ensureDayStyles() {
@@ -136,7 +140,13 @@ function ensureDayStyles() {
   const el = document.createElement('style')
   el.textContent =
     '@keyframes hday-confetti{0%{transform:translateY(-10vh) rotate(0)}100%{transform:translateY(110vh) rotate(720deg)}}' +
-    '@keyframes hday-stale{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}50%{box-shadow:0 0 0 3px rgba(239,68,68,.35)}}'
+    '@keyframes hday-stale{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}50%{box-shadow:0 0 0 3px rgba(239,68,68,.35)}}' +
+    '.hday-card{transition:transform .18s ease,box-shadow .18s ease}' +
+    '.hday-card:hover{transform:translateY(-1px);box-shadow:0 10px 28px -12px rgba(0,0,0,.5)}' +
+    '.hday-stat{transition:transform .15s ease,box-shadow .15s ease}' +
+    '.hday-stat:hover{transform:translateY(-1px);box-shadow:0 6px 18px -8px rgba(0,0,0,.4)}' +
+    '.hday-chip{transition:background .15s ease}' +
+    '.hday-chip:hover{background:var(--ui-bg-quaternary)}'
   document.head.appendChild(el)
 }
 
@@ -563,18 +573,59 @@ const invalidate = () => {
 // small shared bits
 // ---------------------------------------------------------------------------
 
-function SectionLabel({ icon, title, count, tone }) {
+function SectionLabel({ icon, title, count, tone, color, action }) {
   return jsxs('div', {
     className: 'mb-2 flex items-center gap-2 px-1',
     children: [
-      jsx(Codicon, { name: icon, className: cn('text-[0.8rem]', tone || 'text-muted-foreground') }),
       jsx('span', {
-        className: 'text-[0.72rem] font-semibold uppercase tracking-wider text-muted-foreground',
+        className: 'inline-flex size-5 items-center justify-center rounded-md',
+        style: { color: color || 'var(--ui-text-tertiary)', background: `${color || '#8b949e'}1f` },
+        children: jsx(Codicon, { name: icon, size: 12 })
+      }),
+      jsx('span', {
+        className: 'text-[0.74rem] font-semibold uppercase tracking-wider text-(--ui-text-secondary)',
         children: title
       }),
       typeof count === 'number'
-        ? jsx(Badge, { size: 'xs', variant: tone === 'text-amber-500' ? 'warn' : 'muted', children: String(count) })
-        : null
+        ? jsx('span', {
+            className: 'rounded-full px-1.5 py-px text-[0.62rem] font-semibold tabular-nums',
+            style: { color: color || 'var(--ui-text-tertiary)', background: `${color || '#8b949e'}1f` },
+            children: String(count)
+          })
+        : null,
+      jsx('span', { className: 'mx-1 h-px flex-1 bg-(--ui-stroke-secondary) opacity-60' }),
+      action || null
+    ]
+  })
+}
+
+/** big clickable stat tile — the hero strip's primary dashboard read */
+function StatTile({ icon, label, n, color, scrollTo }) {
+  return jsxs('button', {
+    type: 'button',
+    className: 'hday-stat flex min-w-0 items-center gap-3 rounded-xl border border-(--ui-stroke-secondary) px-4 py-2.5 text-left',
+    style: { background: `linear-gradient(120deg, ${color}12, transparent 55%), var(--ui-bg-secondary)` },
+    onClick: () => {
+      if (scrollTo) {
+        try {
+          document.getElementById(scrollTo)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        } catch {}
+      }
+      haptic('selection')
+    },
+    children: [
+      jsx('span', {
+        className: 'inline-flex size-8 shrink-0 items-center justify-center rounded-lg',
+        style: { color, background: `${color}22` },
+        children: jsx(Codicon, { name: icon, size: 16 })
+      }),
+      jsxs('span', {
+        className: 'flex min-w-0 flex-col',
+        children: [
+          jsx('span', { className: 'text-lg font-bold leading-5 tabular-nums', style: { color: n ? color : 'var(--ui-text-tertiary)' }, children: String(n) }),
+          jsx('span', { className: 'truncate text-[0.66rem] font-medium uppercase tracking-wider text-muted-foreground', children: label })
+        ]
+      })
     ]
   })
 }
@@ -723,9 +774,10 @@ function NeedsYouCard({ item, selected, longest }) {
   else body = jsx(GenericRequestBody, { item, busy, open })
 
   return jsxs('div', {
-    className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary) p-3 shadow-sm',
+    className: 'hday-card rounded-xl border border-(--ui-stroke-secondary) p-3.5',
     style: {
       borderLeft: `3px solid ${accent.color}`,
+      background: `linear-gradient(100deg, ${accent.color}16 0%, transparent 45%), var(--ui-bg-secondary)`,
       ...(stale ? { animation: 'hday-stale 2.4s ease-in-out infinite' } : null),
       ...(selected ? { boxShadow: `0 0 0 2px ${accent.color}55` } : null)
     },
@@ -769,8 +821,8 @@ function ApprovalBody({ item, busy, run, open }) {
         : null,
       p.command
         ? jsx('pre', {
-            className:
-              'mb-2 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-primary) p-2 font-mono text-[0.72rem] leading-5 text-(--ui-text-primary)',
+            className: 'mb-2 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-lg p-2.5 font-mono text-[0.74rem] leading-5',
+            style: { background: 'rgba(13,17,23,.9)', color: '#e6edf3', border: '1px solid rgba(255,255,255,.09)' },
             children: String(p.command)
           })
         : null,
@@ -788,7 +840,7 @@ function ApprovalBody({ item, busy, run, open }) {
               Button,
               {
                 size: 'xs',
-                variant: choice === 'deny' ? 'outline' : 'secondary',
+                variant: choice === 'deny' ? 'outline' : choice === 'once' ? 'default' : 'secondary',
                 disabled: Boolean(busy),
                 onClick: () => run(`c:${choice}`, () => respondApproval(item, choice)),
                 children: busy === `c:${choice}` ? spinIcon('sync') : APPROVAL_LABELS[choice] || choice
@@ -1341,30 +1393,100 @@ function QuickTaskBar() {
     }
   }
 
+  const prompts = useValue($prompts) || DEFAULT_PROMPTS
+  const [adding, setAdding] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  const savePrompts = list => {
+    $prompts.set(list)
+    try {
+      storageRef && storageRef.set(PROMPTS_KEY, list)
+    } catch {}
+  }
+
   return jsxs('div', {
-    className:
-      'flex items-center gap-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary) px-3 py-2',
     children: [
-      jsx(Codicon, { name: 'sparkle', className: 'shrink-0 text-[0.85rem] text-primary/80' }),
-      jsx(Input, {
-        value: text,
-        placeholder: 'Start something — “review my PRs”, “summarize overnight logs”…',
-        disabled: busy,
-        onChange: ev => setText(ev.target.value),
-        onKeyDown: ev => {
-          if (isSubmitEnter(ev)) submit()
-        },
-        className: 'h-7 flex-1 border-none bg-transparent px-0 text-[0.82rem] shadow-none focus-visible:ring-0'
+      jsxs('div', {
+        className: 'flex items-center gap-2.5 rounded-xl border border-(--ui-stroke-secondary) px-4 py-2.5 shadow-sm',
+        style: { background: 'linear-gradient(100deg, rgba(88,166,255,.10), transparent 55%), var(--ui-bg-secondary)' },
+        children: [
+          jsx('span', {
+            className: 'inline-flex size-7 shrink-0 items-center justify-center rounded-lg',
+            style: { color: '#58a6ff', background: '#58a6ff22' },
+            children: jsx(Codicon, { name: 'sparkle', size: 14 })
+          }),
+          jsx(Input, {
+            value: text,
+            placeholder: 'Start something — “review my PRs”, “summarize overnight logs”…',
+            disabled: busy,
+            onChange: ev => setText(ev.target.value),
+            onKeyDown: ev => {
+              if (isSubmitEnter(ev)) submit()
+            },
+            className: 'h-8 flex-1 border-none bg-transparent px-0 text-[0.9rem] shadow-none focus-visible:ring-0'
+          }),
+          note ? jsx('span', { className: 'shrink-0 truncate text-[0.68rem] text-muted-foreground', children: note }) : null,
+          jsx(Button, {
+            size: 'sm',
+            variant: 'default',
+            disabled: busy || !text.trim(),
+            onClick: submit,
+            children: busy ? spinIcon('sync') : 'Start'
+          })
+        ]
       }),
-      note
-        ? jsx('span', { className: 'shrink-0 truncate text-[0.68rem] text-muted-foreground', children: note })
-        : null,
-      jsx(Button, {
-        size: 'xs',
-        variant: 'secondary',
-        disabled: busy || !text.trim(),
-        onClick: submit,
-        children: busy ? spinIcon('sync') : 'Start'
+      jsxs('div', {
+        className: 'mt-1.5 flex flex-wrap items-center gap-1.5 px-1',
+        children: [
+          prompts.map(p =>
+            jsxs(
+              'span',
+              {
+                className: 'hday-chip group/chip inline-flex items-center gap-1 rounded-full border border-(--ui-stroke-secondary) px-2.5 py-0.5 text-[0.68rem] text-muted-foreground',
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    className: 'max-w-48 truncate hover:text-(--ui-text-primary)',
+                    onClick: () => setText(p),
+                    children: p
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className: 'opacity-0 group-hover/chip:opacity-100',
+                    onClick: () => savePrompts(prompts.filter(x => x !== p)),
+                    children: jsx(Codicon, { name: 'close', size: 10 })
+                  })
+                ]
+              },
+              p
+            )
+          ),
+          adding
+            ? jsxs('span', {
+                className: 'inline-flex items-center gap-1',
+                children: [
+                  jsx(Input, {
+                    value: draft,
+                    placeholder: 'New preset…',
+                    onChange: ev => setDraft(ev.target.value),
+                    onKeyDown: ev => {
+                      if (isSubmitEnter(ev) && draft.trim()) {
+                        savePrompts([...prompts, draft.trim()])
+                        setDraft('')
+                        setAdding(false)
+                      } else if (ev.key === 'Escape') setAdding(false)
+                    },
+                    className: 'h-6 w-40 text-[0.68rem]'
+                  })
+                ]
+              })
+            : jsxs('button', {
+                type: 'button',
+                className: 'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.66rem] text-muted-foreground/70 hover:text-(--ui-text-primary)',
+                onClick: () => setAdding(true),
+                children: [jsx(Codicon, { name: 'add', size: 10 }), 'save a prompt']
+              })
+        ]
       })
     ]
   })
@@ -1408,6 +1530,16 @@ const greeting = () => {
   if (h < 12) return 'Good morning'
   if (h < 17) return 'Good afternoon'
   return 'Good evening'
+}
+
+/** accent tint for the header — follows the time of day */
+const dayTint = () => {
+  const h = new Date().getHours()
+  if (h < 5) return '#a855f7'
+  if (h < 12) return '#f59e0b'
+  if (h < 17) return '#58a6ff'
+  if (h < 21) return '#f472b6'
+  return '#a855f7'
 }
 
 // ---------------------------------------------------------------------------
@@ -1616,6 +1748,7 @@ function DayPage() {
       celebrate ? jsx(Confetti, { onDone: () => setCelebrate(false) }) : null,
       jsxs('header', {
         className: 'flex shrink-0 items-center justify-between gap-4 border-b border-(--ui-stroke-secondary) px-6 py-4',
+        style: { background: `linear-gradient(180deg, ${dayTint()}10, transparent)` },
         children: [
           jsxs('div', {
             className: 'flex min-w-0 items-baseline gap-3',
@@ -1639,8 +1772,6 @@ function DayPage() {
                     className: 'gap-1',
                     children: [jsx(Codicon, { name: 'check' }), 'caught up']
                   }),
-              flight.length ? jsx(Badge, { variant: 'muted', children: `${flight.length} in flight` }) : null,
-              finished.length ? jsx(Badge, { variant: 'muted', children: `${finished.length} to review` }) : null,
               triageToday()
                 ? jsxs(Badge, {
                     variant: 'outline',
@@ -1695,6 +1826,15 @@ function DayPage() {
       jsxs('div', {
         className: 'mx-auto w-full max-w-6xl shrink-0 px-6 pt-4',
         children: [
+          jsxs('div', {
+            className: 'mb-3 grid grid-cols-2 gap-2 md:grid-cols-4',
+            children: [
+              jsx(StatTile, { icon: 'bell-dot', label: 'Waiting on you', n: needs.length, color: '#f59e0b', scrollTo: 'hday-needs' }),
+              jsx(StatTile, { icon: 'rocket', label: 'In flight', n: flight.length, color: '#58a6ff', scrollTo: 'hday-flight' }),
+              jsx(StatTile, { icon: 'pass', label: 'To review', n: finished.length, color: '#34d399', scrollTo: 'hday-finished' }),
+              jsx(StatTile, { icon: 'calendar', label: 'Scheduled', n: jobs.length, color: '#a855f7', scrollTo: 'hday-sched' })
+            ]
+          }),
           jsx(QuickTaskBar, {}),
           jsxs('div', {
             className: 'mt-2 flex items-center gap-3 px-1',
@@ -1740,8 +1880,9 @@ function DayPage() {
                   : null,
                 needs.length
                   ? jsxs('section', {
+                      id: 'hday-needs',
                       children: [
-                        jsx(SectionLabel, { icon: 'bell-dot', title: 'Needs you', count: needs.length, tone: 'text-amber-500' }),
+                        jsx(SectionLabel, { icon: 'bell-dot', title: 'Needs you', count: needs.length, color: '#f59e0b' }),
                         floodSessions.length
                           ? jsx('div', {
                               className: 'mb-2 flex flex-col gap-1.5',
@@ -1771,23 +1912,42 @@ function DayPage() {
                 !focus && waiting.length
                   ? jsxs('section', {
                       children: [
-                        jsx(SectionLabel, { icon: 'watch', title: 'Waiting on input', count: waiting.length, tone: 'text-amber-500' }),
+                        jsx(SectionLabel, { icon: 'watch', title: 'Waiting on input', count: waiting.length, color: '#f59e0b' }),
                         jsx('div', { className: 'flex flex-col', children: waiting.map(r => jsx(FlightRow, { row: r }, `${r.sourceKey}#${r.session.id}`)) })
                       ]
                     })
                   : null,
                 flight.length
                   ? jsxs('section', {
+                      id: 'hday-flight',
                       children: [
-                        jsx(SectionLabel, { icon: 'rocket', title: 'In flight', count: flight.length }),
+                        jsx(SectionLabel, { icon: 'rocket', title: 'In flight', count: flight.length, color: '#58a6ff' }),
                         jsx('div', { className: 'flex flex-col', children: flight.map(r => jsx(FlightRow, { row: r }, `${r.sourceKey}#${r.session.id}`)) })
                       ]
                     })
                   : null,
                 !focus && finished.length
                   ? jsxs('section', {
+                      id: 'hday-finished',
                       children: [
-                        jsx(SectionLabel, { icon: 'pass', title: 'Finished — review', count: finished.length }),
+                        jsx(SectionLabel, {
+                          icon: 'pass',
+                          title: 'Finished — review',
+                          count: finished.length,
+                          color: '#34d399',
+                          action: jsx(Button, {
+                            size: 'xs',
+                            variant: 'ghost',
+                            className: 'h-5 px-1.5 text-[0.62rem] text-muted-foreground',
+                            onClick: () => {
+                              $finished.get().forEach(f => bumpTriage())
+                              $finished.set([])
+                              persistFinished([])
+                              haptic('selection')
+                            },
+                            children: 'Clear all'
+                          })
+                        }),
                         jsx('div', { className: 'flex flex-col', children: finished.map(f => jsx(FinishedRow, { f }, f.key)) })
                       ]
                     })
@@ -1828,14 +1988,15 @@ function DayPage() {
                 watching.length
                   ? jsxs('section', {
                       children: [
-                        jsx(SectionLabel, { icon: 'pinned', title: 'Watching', count: watching.length }),
+                        jsx(SectionLabel, { icon: 'pinned', title: 'Watching', count: watching.length, color: '#58a6ff' }),
                         jsx('div', { className: 'flex flex-col', children: watching.map(w => jsx(WatchingRow, { entry: w }, w.storedId)) })
                       ]
                     })
                   : null,
                 jsxs('section', {
+                  id: 'hday-sched',
                   children: [
-                    jsx(SectionLabel, { icon: 'calendar', title: 'Scheduled', count: jobs.length }),
+                    jsx(SectionLabel, { icon: 'calendar', title: 'Scheduled', count: jobs.length, color: '#a855f7' }),
                     jobs.length
                       ? jsx('div', { className: 'flex flex-col', children: jobs.slice(0, 20).map(j2 => jsx(CronRow, { entry: j2 }, j2.key)) })
                       : jsx('div', { className: 'px-2 py-3 text-[0.72rem] text-muted-foreground', children: 'No scheduled jobs.' })
@@ -1951,6 +2112,8 @@ export default {
     $muted.set(loadMap(MUTED_KEY))
     $snoozed.set(loadMap(SNOOZE_KEY))
     $pinned.set(loadMap(PINNED_KEY))
+    const savedPrompts = storageRef ? storageRef.get(PROMPTS_KEY, null) : null
+    $prompts.set(Array.isArray(savedPrompts) && savedPrompts.length ? savedPrompts : DEFAULT_PROMPTS)
     $prefs.set({ notify: true, ...loadMap(PREFS_KEY) })
 
     ctx.onEvent('message.complete', ev => recordFinished(ev, 'done'))
