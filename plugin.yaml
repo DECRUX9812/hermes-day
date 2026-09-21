@@ -23,6 +23,12 @@ provides_hooks:
   - transform_tool_result
   - pre_verify
   - on_session_finalize
+  - pre_approval_request
+  - post_approval_response
+  - agent_loop_stopped
+  - subagent_stop
+  - api_request_error
+  - pre_llm_call
 provides_middleware: []
 requires_env: []
 config_schema:

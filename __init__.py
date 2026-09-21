@@ -33,6 +33,28 @@ Companion to the desktop cockpit (``desktop/plugin.js``). Registers:
   ``/day-vacuum <session_key>`` (or the cockpit button), verbose terminal
   outputs are archived to disk and replaced with a compact placeholder
   before they enter context.
+- ``pre_approval_request`` / ``post_approval_response`` — observer-only
+  (they cannot veto), but they expose the REAL approval stream: the command,
+  the pattern that fired, which surface asked (cli/gateway/smart), whether a
+  human or the smart-approval aux LLM decided (``decided_by``), and how long
+  the human took. A deliberate human ``deny`` promotes into the repo's
+  negative-instinct ledger, so a refusal today is a constraint tomorrow;
+  ``timeout``/``cancelled`` are booked as approval debt instead, since those
+  mean the prompt never reached a human.
+- ``agent_loop_stopped`` — a running turn was interrupted (``/stop``, the
+  ``/new`` fast-path, or the desktop ``session.interrupt`` path).
+- ``subagent_stop`` — delegation outcomes tallied per parent session; only
+  ``failed``/``error``/``interrupted`` children raise an attention item.
+- ``api_request_error`` — failed provider attempts, identity-deduped over 60s
+  so a retry storm cannot flood the feed.
+- ``pre_llm_call`` — mid-session instinct re-assertion. The system-prompt
+  section renders once and is frozen for the life of the conversation, so a
+  trap learned mid-session could not otherwise reach the running agent; this
+  returns the newly-promoted set into the turn's user message (never the
+  system prompt, which would break the prompt cache) and only when something
+  genuinely new landed.
+- ``/day-approvals`` — the approval ledger (counts, stalls, denies, latency).
+- ``/day-attention`` — interruptions, provider errors, failed subagents.
 
 State: per-session records in ``ctx.state`` under the ``sessions`` key
 (capped, trimmed), plus an in-memory mirror for hot-path updates.
@@ -57,7 +79,10 @@ _MAX_BLOCKS = 20
 _MAX_SNAPS = 25
 _MAX_INSTINCTS = 60             # per repo ledger
 _MAX_VERIFY_NUDGES = 2          # self-throttle; framework caps at agent.max_verify_nudges
-_VACUUM_MIN_LINES = 40          # results longer than this get trimmed when armed
+_MAX_APPROVALS = 40              # per-session approval ledger
+_MAX_ATTN = 40                   # per-session attention ledger
+_ATTN_KINDS = ("interrupted", "provider_error", "subagent_failed", "approval_stall")
+_VACUUM_MIN_LINES = 40           # results longer than this get trimmed when armed
 _VACUUM_HEAD = 6
 _VACUUM_TAIL = 3
 
@@ -145,7 +170,8 @@ _PATH_KEYS = ("path", "file_path", "target_file", "filePath", "notebook_path")
 
 def _new_rec() -> Dict[str, Any]:
     return {"files": [], "runs": [], "blocks": [], "verdict": None,
-            "detail": "", "at": 0.0, "nudges": 0, "snaps": []}
+            "detail": "", "at": 0.0, "nudges": 0, "snaps": [],
+            "approvals": [], "attn": [], "inst_epoch": 0.0}
 
 
 def _rec(sid: str) -> Dict[str, Any]:
@@ -314,7 +340,15 @@ def _instincts_section(session_info: Dict[str, Any]) -> str:
     try:
         if not _enabled("instincts"):
             return ""
-        return _instincts_block(str((session_info or {}).get("cwd") or ""))
+        info = session_info or {}
+        # Stamp the session: everything promoted from here on is "new" and gets
+        # re-asserted mid-conversation by _pre_llm_call, since these very bytes
+        # are frozen for the life of the conversation.
+        sid = str(info.get("session_id") or "")
+        if sid:
+            with _LOCK:
+                _rec(sid)["inst_epoch"] = time.time()
+        return _instincts_block(str(info.get("cwd") or ""))
     except Exception:
         return ""
 
@@ -779,6 +813,10 @@ def _public_rec(rec: Dict[str, Any]) -> Dict[str, Any]:
                    "root": s.get("root"), "ts": s.get("ts")}
                   for s in (rec.get("snaps") or [])],
         "vacuum": dict(rec.get("vacuum") or {}),
+        "approvals": (rec.get("approvals") or [])[-12:],
+        "attn": (rec.get("attn") or [])[-12:],
+        "subagents": dict(rec.get("subagents") or {}),
+        "last_subagent": rec.get("sub_last") or {},
     }
 
 
@@ -786,7 +824,8 @@ def _cmd_evidence(arg: str = "") -> str:
     with _LOCK:
         sessions = {sid: _public_rec(r) for sid, r in _SESSIONS.items()
                     if r.get("verdict") or r.get("runs") or r.get("blocks")
-                    or r.get("vacuum") or (r.get("snaps") or [])}
+                    or r.get("vacuum") or (r.get("snaps") or [])
+                    or r.get("approvals") or r.get("attn")}
     sid = (arg or "").strip()
     if sid:
         return json.dumps({"ok": True, "sessions": {sid: sessions.get(sid)}})
@@ -1045,6 +1084,280 @@ def _cmd_vacuum(arg: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Approval lifecycle, attention ledger, mid-session instincts (observer hooks)
+#
+# ``pre_approval_request`` / ``post_approval_response`` are observer-only (they
+# cannot veto), but they hand the cockpit the REAL approval stream instead of an
+# inferred one: which surface asked, which pattern fired, whether a human or the
+# smart-approval aux LLM decided, and how long the human took to answer. A
+# deliberate human ``deny`` is the highest-signal trap there is, so it promotes
+# straight into the repo's negative-instinct ledger — the same ledger the honesty
+# guard feeds. ``timeout``/``cancelled`` are NOT denials (docs: the prompt never
+# reached a human), so they are booked as approval debt instead of instincts.
+#
+# ``pre_llm_call`` closes the staleness gap in the system-prompt section: that
+# section renders once per new session and its bytes are frozen, so an instinct
+# learned MID-session cannot reach the running conversation. Anything injected
+# mid-conversation must ride a user message (never the system prompt) to keep the
+# prompt cache intact — which is exactly what this hook returns.
+# ---------------------------------------------------------------------------
+
+_PENDING_APPROVALS: list = []    # unresolved pre_approval_request entries
+_PROV_ERR_TS: Dict[str, float] = {}   # dedupe identical provider errors (60s)
+_DENY_CHOICES = {"deny"}
+_STALL_CHOICES = {"timeout", "cancelled", "notify_failed"}
+
+
+def _brief(text: Any, n: int = 300) -> str:
+    return " ".join(str(text or "").split())[:n]
+
+
+def _attn_add(rec: Dict[str, Any], kind: str, text: str, **extra: Any) -> None:
+    """Append one attention item. Caller holds _LOCK."""
+    item = {"kind": kind, "text": _brief(text), "ts": time.time()}
+    item.update(extra)
+    _append(rec["attn"], item, _MAX_ATTN)
+
+
+def _pre_approval_request(command: str = "", description: str = "",
+                          pattern_key: str = "", pattern_keys: Optional[list] = None,
+                          session_key: str = "", surface: str = "",
+                          session_id: str = "", turn_id: str = "",
+                          tool_call_id: str = "", **_kw: Any) -> None:
+    """Record an approval request the moment it is raised."""
+    try:
+        entry = {"cmd": _brief(command), "desc": _brief(description, 200),
+                 "key": pattern_key or "", "keys": [str(k) for k in (pattern_keys or [])],
+                 "surface": surface or "", "sk": session_key or "",
+                 "turn": turn_id or "", "tcid": tool_call_id or "",
+                 "ts": time.time(), "choice": "", "by": "", "ms": -1}
+        with _LOCK:
+            rec = _rec(session_id or session_key or "")
+            _append(rec["approvals"], entry, _MAX_APPROVALS)
+            _PENDING_APPROVALS.append(entry)
+            del _PENDING_APPROVALS[:-80]      # bound in-flight correlation set
+            rec["at"] = entry["ts"]
+        _persist()
+    except Exception:
+        pass
+
+
+def _post_approval_response(command: str = "", description: str = "",
+                            pattern_key: str = "", pattern_keys: Optional[list] = None,
+                            session_key: str = "", surface: str = "",
+                            session_id: str = "", turn_id: str = "",
+                            tool_call_id: str = "", choice: str = "",
+                            decided_by: str = "", **_kw: Any) -> None:
+    """Resolve the matching request, then book the outcome."""
+    try:
+        now = time.time()
+        cmd = _brief(command)
+        want = pattern_key or ""
+        choice = choice or ""
+        with _LOCK:
+            hit = None
+            for e in reversed(_PENDING_APPROVALS):     # newest unresolved match
+                if e.get("choice") or e.get("cmd") != cmd or e.get("key") != want:
+                    continue
+                if session_key and e.get("sk") and e["sk"] != session_key:
+                    continue
+                hit = e
+                break
+            rec = _rec(session_id or session_key or "")
+            if hit is not None:
+                hit["choice"] = choice
+                hit["by"] = decided_by or ""
+                hit["ms"] = max(0, int((now - float(hit.get("ts") or now)) * 1000))
+                if hit.get("surface"):
+                    surface = hit["surface"]
+                try:
+                    _PENDING_APPROVALS.remove(hit)
+                except ValueError:
+                    pass
+            else:                                       # response with no seen request
+                entry = {"cmd": cmd, "desc": _brief(description, 200), "key": want,
+                         "keys": [str(k) for k in (pattern_keys or [])],
+                         "surface": surface or "", "sk": session_key or "",
+                         "turn": turn_id or "", "tcid": tool_call_id or "",
+                         "ts": now, "choice": choice, "by": decided_by or "", "ms": -1}
+                _append(rec["approvals"], entry, _MAX_APPROVALS)
+
+            if choice in _DENY_CHOICES:
+                _promote_instinct(rec, None, want or "approval",
+                                  cmd, "you denied this command: "
+                                       + _brief(description, 140) or "refused")
+            elif choice in _STALL_CHOICES:
+                _attn_add(rec, "approval_stall",
+                          f"approval never answered ({choice}) — agent waited on you",
+                          key=want, surface=surface or "")
+            rec["at"] = now
+        _persist()
+    except Exception:
+        pass
+
+
+def _agent_loop_stopped(session_key: str = "", platform: str = "",
+                        reason: str = "", invalidation_reason: str = "",
+                        **_kw: Any) -> None:
+    """A running turn was interrupted (/stop, /new fast-path, desktop interrupt)."""
+    try:
+        with _LOCK:
+            rec = _rec(session_key)
+            _attn_add(rec, "interrupted",
+                      f"turn interrupted: {reason or 'stop'}", platform=platform or "",
+                      reason=reason or "", detail=invalidation_reason or "")
+            rec["at"] = time.time()
+        _persist()
+    except Exception:
+        pass
+
+
+def _subagent_stop(parent_session_id: str = "", child_role: Optional[str] = None,
+                   child_summary: Optional[str] = None, child_status: str = "",
+                   tool_call_history: Optional[list] = None,
+                   duration_ms: int = 0, **_kw: Any) -> None:
+    """Delegation finished — tally it, and surface only the bad endings.
+
+    Fires many times per turn under heavy fan-out, so the common (successful)
+    path stays in memory and skips the persist.
+    """
+    try:
+        status = child_status or "unknown"
+        dur = int(duration_ms or 0)
+        with _LOCK:
+            rec = _rec(parent_session_id)
+            tally = rec.setdefault("subagents", {})
+            tally[status] = int(tally.get(status) or 0) + 1
+            rec["sub_last"] = {"role": child_role or "", "status": status, "ms": dur,
+                               "tools": len(tool_call_history or []), "ts": time.time()}
+            if status in ("failed", "error", "interrupted"):
+                _attn_add(rec, "subagent_failed",
+                          f"{child_role or 'subagent'} {status}: "
+                          f"{_brief(child_summary, 160)}",
+                          status=status, role=child_role or "", ms=dur)
+            else:
+                return
+            rec["at"] = time.time()
+        _persist()
+    except Exception:
+        pass
+
+
+def _api_request_error(session_id: str = "", provider: str = "", model: str = "",
+                       status_code: Optional[int] = None, retryable: Optional[bool] = None,
+                       reason: Optional[str] = None, error: Any = None,
+                       **_kw: Any) -> None:
+    """Provider attempt failed — a real triage signal (identity-deduped, 60s)."""
+    try:
+        if isinstance(error, dict):
+            msg = error.get("message") or error.get("type") or ""
+        else:
+            msg = str(error or "")
+        msg = _brief(msg or reason or "provider error", 200)
+        sig = f"{provider}|{status_code}|{msg}"
+        with _LOCK:
+            now = time.time()
+            last = _PROV_ERR_TS.get(sig)
+            if last is not None and now - last < 60:
+                return
+            _PROV_ERR_TS[sig] = now
+            if len(_PROV_ERR_TS) > 200:
+                for k in sorted(_PROV_ERR_TS, key=lambda k: _PROV_ERR_TS[k])[:100]:
+                    _PROV_ERR_TS.pop(k, None)
+            rec = _rec(session_id)
+            _attn_add(rec, "provider_error", msg, provider=provider or "",
+                      status=status_code, retryable=retryable, reason=reason or "")
+            rec["at"] = now
+        _persist()
+    except Exception:
+        pass
+
+
+def _pre_llm_call(session_id: str = "", user_message: str = "",
+                  conversation_history: Optional[list] = None,
+                  is_first_turn: bool = False, platform: str = "",
+                  **_kw: Any) -> Optional[str]:
+    """Surface instincts promoted AFTER this session's prompt was frozen.
+
+    The system-prompt section is rendered once and byte-stable for the life of
+    the conversation, so a trap learned mid-session never reaches the running
+    agent. Returning text here appends it to the turn's user message — the
+    sanctioned, cache-safe channel. Silent unless something genuinely new landed.
+    """
+    try:
+        if not _enabled("instincts"):
+            return None
+        with _LOCK:
+            rec = _SESSIONS.get(session_id or "")
+            if rec is None:
+                return None
+            since = float(rec.get("inst_epoch") or 0.0)
+            if since <= 0:
+                return None
+            fresh: list = []
+            for root in _instinct_roots():
+                for i in _load_instincts(root):
+                    if i.get("enabled", True) and float(i.get("created") or 0) > since:
+                        fresh.append((root, i))
+            if not fresh:
+                return None
+            rec["inst_epoch"] = time.time()          # surface each one exactly once
+        fresh.sort(key=lambda p: float(p[1].get("created") or 0))
+        lines = ["[Hermes Day — new negative instincts learned this session]"]
+        for root, i in fresh[:6]:
+            lines.append(f"- In {os.path.basename(root) or root}: NEVER "
+                         f"{_brief(i.get('trigger_pattern'), 120)} — "
+                         f"{_brief(i.get('reason'), 140)}")
+        lines.append("These were blocked or refused earlier in this conversation. "
+                     "Do not retry them.")
+        block = "\n".join(lines)
+        return block if len(block) < 1200 else block[:1200]
+    except Exception:
+        return None
+
+
+def _approval_digest(limit: int = 12) -> Dict[str, Any]:
+    """Rolling approval ledger across sessions — the cockpit's approvals view."""
+    with _LOCK:
+        rows: list = []
+        by_choice: Dict[str, int] = {}
+        stalls = denies = 0
+        for sid, rec in _SESSIONS.items():
+            for a in rec.get("approvals") or []:
+                by_choice[a["choice"] or "pending"] = \
+                    by_choice.get(a["choice"] or "pending", 0) + 1
+                if a.get("choice") in _STALL_CHOICES:
+                    stalls += 1
+                elif a.get("choice") in _DENY_CHOICES:
+                    denies += 1
+                rows.append({**a, "sid": sid})
+        rows.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+    return {"ok": True, "counts": by_choice, "stalls": stalls, "denies": denies,
+            "pending": len(_PENDING_APPROVALS), "recent": rows[:limit]}
+
+
+def _cmd_approvals(arg: str = "") -> str:
+    try:
+        limit = int((arg or "").strip() or 12)
+    except ValueError:
+        limit = 12
+    return json.dumps(_approval_digest(max(1, min(limit, 60))))
+
+
+def _cmd_attention(arg: str = "") -> str:
+    """Session-attention feed: interruptions, provider errors, failed children."""
+    with _LOCK:
+        out = {}
+        for sid, rec in _SESSIONS.items():
+            items = rec.get("attn") or []
+            if not items:
+                continue
+            out[sid] = {"items": items[-12:], "subagents": dict(rec.get("subagents") or {}),
+                        "last_subagent": rec.get("sub_last") or {}}
+    return json.dumps({"ok": True, "sessions": out})
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -1070,6 +1383,20 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_verify", _pre_verify)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
     ctx.register_hook("transform_tool_result", _transform_tool_result)
+    # Observer-only surfaces: the real approval stream, stall/error attention,
+    # delegation outcomes, and mid-session instinct re-assertion.
+    for _hook, _fn in (
+        ("pre_approval_request", _pre_approval_request),
+        ("post_approval_response", _post_approval_response),
+        ("agent_loop_stopped", _agent_loop_stopped),
+        ("subagent_stop", _subagent_stop),
+        ("api_request_error", _api_request_error),
+        ("pre_llm_call", _pre_llm_call),
+    ):
+        try:
+            ctx.register_hook(_hook, _fn)
+        except Exception:
+            pass
     try:
         ctx.register_system_prompt_section(
             "hermes_day.instincts", _instincts_section, position="after_memory")
@@ -1108,4 +1435,13 @@ def register(ctx: Any) -> None:
         "day-vacuum", _cmd_vacuum,
         description="Arm context vacuum: verbose tool dumps archive to disk.",
         args_hint="<session_key>",
+    )
+    ctx.register_command(
+        "day-approvals", _cmd_approvals,
+        description="Real approval ledger: surface, pattern, who decided, latency.",
+        args_hint="[limit]",
+    )
+    ctx.register_command(
+        "day-attention", _cmd_attention,
+        description="Attention feed: interruptions, provider errors, failed subagents.",
     )
