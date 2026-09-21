@@ -13,7 +13,14 @@ Hermes Day is a full-screen desktop plugin for [Hermes Agent](https://github.com
 | **In flight** | Sessions actively working or streaming, newest activity first. |
 | **Finished — review** | Turns that completed (or errored) while you weren't looking — persist until you review or dismiss them. |
 | **Scheduled** | Every cron job across sources: next run, overdue and last-failure badges. |
-| **Sources** | Health of every profile/connection the inbox is scanning. |
+| **Sources** | Health of every profile/connection the inbox is scanning — with a per-source mute bell for the noisy ones. |
+
+## Stay in flow
+
+- **Quick-task bar** — type what you want done, hit Enter: the plugin creates the session and submits the prompt without leaving the board.
+- **Desktop notifications** — new needs announce themselves via the OS (bell toggle in the header; the first scan never fires — no notification storm on launch).
+- **Snooze & mute** — snooze a card for 15 minutes, or mute a whole source; hidden items stay out of the counts until they're due.
+- **Flood bar** — when one session stacks up multiple approvals, a single "Allow all" bar clears them in one click via `approval.respond { all: true }`.
 
 ## Act without opening the session
 

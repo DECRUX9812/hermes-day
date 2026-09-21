@@ -91,10 +91,27 @@ const KIND_RANK = { approval: 0, clarify: 1, input: 2, other: 3 }
 const firstSeen = new Map()
 /** runtime session id -> { storedId, title, route } from the last scan */
 const lastLive = new Map()
-/** ctx.storage, captured in register() for the module-level event handlers */
+/** ctx.storage / ctx.os, captured in register() for module-level use */
 let storageRef = null
+let notifyRef = null
 /** finished-but-unreviewed sessions, persisted across reloads */
 const $finished = atom([])
+/** muted sources — hidden from counts until unmuted (Sources rail toggle) */
+const $muted = atom({})
+/** snoozed requests — requestId -> unix ms until which the card stays hidden */
+const $snoozed = atom({})
+/** user prefs — { notify: boolean } */
+const $prefs = atom({ notify: true })
+/** request ids already notified about this app session */
+const notified = new Set()
+/** first scan seeds `notified` silently — no burst on app start */
+let notifyArmed = false
+
+const SNOOZE_MS = 15 * 60 * 1000
+
+const MUTED_KEY = 'muted.v1'
+const SNOOZE_KEY = 'snoozed.v1'
+const PREFS_KEY = 'prefs.v1'
 
 const routeKey = route =>
   route ? `${route.connectionId ?? ''}/${route.profile ?? ''}/${route.targetProfile ?? ''}` : 'local'
@@ -206,7 +223,36 @@ async function scanInbox() {
   }
   needs.sort((a, b) => KIND_RANK[a.kind] - KIND_RANK[b.kind] || a.firstSeenAt - b.firstSeenAt)
   flight.sort((a, b) => (epochMs(b.session.last_active) ?? 0) - (epochMs(a.session.last_active) ?? 0))
-  return { scannedAt: Date.now(), sources, needs, flight, waiting }
+
+  // mute + snooze are presentation-layer filters on top of the raw truth
+  const muted = $muted.get()
+  const snoozed = $snoozed.get()
+  const now = Date.now()
+  for (const n of needs) {
+    n.muted = Boolean(muted[n.sourceKey])
+    n.snoozedUntil = snoozed[n.requestId] || 0
+  }
+  const visible = needs.filter(n => !n.muted && n.snoozedUntil <= now)
+
+  // notify on genuinely NEW waiting items — never on the boot scan
+  if (notifyRef && $prefs.get().notify) {
+    if (notifyArmed) {
+      for (const n of visible) {
+        if (notified.has(n.requestId)) continue
+        notified.add(n.requestId)
+        const title = n.kind === 'approval' ? 'Approval needed' : n.kind === 'clarify' ? 'Question from Hermes' : 'Input needed'
+        const body = `${n.title}: ${n.params.command || n.params.question || n.params.description || n.method}`.slice(0, 140)
+        try {
+          notifyRef.notify({ title, body })
+        } catch {}
+      }
+    } else {
+      for (const n of visible) notified.add(n.requestId)
+      notifyArmed = true
+    }
+  }
+
+  return { scannedAt: Date.now(), sources, needs: visible, hiddenCount: needs.length - visible.length, flight, waiting }
 }
 
 async function scanCron() {
@@ -244,6 +290,42 @@ async function scanCron() {
 // ---------------------------------------------------------------------------
 // finished-but-unreviewed — event driven, persisted via ctx.storage
 // ---------------------------------------------------------------------------
+
+const loadMap = key => {
+  try {
+    const v = storageRef ? storageRef.get(key, {}) : {}
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {}
+  } catch {
+    return {}
+  }
+}
+
+const persistMap = (key, map) => {
+  try {
+    storageRef && storageRef.set(key, map)
+  } catch {}
+}
+
+const toggleMute = key => {
+  const next = { ...$muted.get() }
+  if (next[key]) delete next[key]
+  else next[key] = true
+  $muted.set(next)
+  persistMap(MUTED_KEY, next)
+}
+
+const snoozeRequest = requestId => {
+  const next = { ...$snoozed.get(), [requestId]: Date.now() + SNOOZE_MS }
+  $snoozed.set(next)
+  persistMap(SNOOZE_KEY, next)
+  invalidate()
+}
+
+const setNotifyPref = on => {
+  const next = { ...$prefs.get(), notify: on }
+  $prefs.set(next)
+  persistMap(PREFS_KEY, next)
+}
 
 const loadFinished = () => {
   try {
@@ -327,6 +409,25 @@ async function respondClarifyBatch(item, answersByQid) {
   }
 }
 
+/** Kick off a brand-new task on the active profile — create + first prompt. */
+async function startTask(text) {
+  const title = text.length > 60 ? `${text.slice(0, 57)}…` : text
+  const created = await host.request('session.create', { title, source: 'desktop' })
+  const sessionId = created && created.session_id
+  if (!sessionId) throw new Error('session.create returned no session')
+  await host.request('prompt.submit', { session_id: sessionId, text })
+  return created
+}
+
+/** Resolve every pending approval in one session at once. */
+async function respondAllForSession(item, choice) {
+  await rpc(item.route, 'approval.respond', {
+    session_id: item.sessionId,
+    choice,
+    all: true
+  })
+}
+
 async function openItemSession(item) {
   const target = item.storedId || item.sessionId
   const opts = {
@@ -392,6 +493,7 @@ const spinIcon = name => jsx(Codicon, { name, spinning: true, className: 'text-[
 function NeedsYouCard({ item }) {
   const [busy, setBusy] = useState('')
   const [failed, setFailed] = useState('')
+  const [, forceTick] = useState(0)
 
   const run = useCallback(
     async (tag, fn) => {
@@ -422,7 +524,20 @@ function NeedsYouCard({ item }) {
       item.storedId ? jsx(SessionStatusDot, { storedSessionId: item.storedId }) : jsx(Codicon, { name: 'comment', className: 'text-muted-foreground' }),
       jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.82rem] font-semibold', children: item.title }),
       jsx(SourcePill, { label: item.sourceLabel }),
-      jsx(AgoText, { ms: item.firstSeenAt })
+      jsx(AgoText, { ms: item.firstSeenAt }),
+      jsx(Tip, {
+        label: 'Snooze 15 min',
+        children: jsx(Button, {
+          size: 'icon-xs',
+          variant: 'ghost',
+          disabled: Boolean(busy),
+          onClick: () => {
+            snoozeRequest(item.requestId)
+            forceTick(t => t + 1)
+          },
+          children: jsx(Codicon, { name: 'snooze' })
+        })
+      })
     ]
   })
 
@@ -829,8 +944,101 @@ function CronRow({ entry }) {
 }
 
 // ---------------------------------------------------------------------------
+// quick-task bar — type a task, Hermes starts it
+// ---------------------------------------------------------------------------
+
+function QuickTaskBar() {
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState('')
+
+  const submit = async () => {
+    const t = text.trim()
+    if (!t || busy) return
+    setBusy(true)
+    setNote('')
+    try {
+      const created = await startTask(t)
+      setText('')
+      setNote(`Started “${(created && created.info && created.info.title) || t.slice(0, 40)}”`)
+      haptic('submit')
+      invalidate()
+    } catch (err) {
+      setNote(`Couldn't start: ${errMsg(err)}`)
+      haptic('cancel')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return jsxs('div', {
+    className:
+      'flex items-center gap-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary) px-3 py-2',
+    children: [
+      jsx(Codicon, { name: 'sparkle', className: 'shrink-0 text-[0.85rem] text-primary/80' }),
+      jsx(Input, {
+        value: text,
+        placeholder: 'Start something — “review my PRs”, “summarize overnight logs”…',
+        disabled: busy,
+        onChange: ev => setText(ev.target.value),
+        onKeyDown: ev => {
+          if (isSubmitEnter(ev)) submit()
+        },
+        className: 'h-7 flex-1 border-none bg-transparent px-0 text-[0.82rem] shadow-none focus-visible:ring-0'
+      }),
+      note
+        ? jsx('span', { className: 'shrink-0 truncate text-[0.68rem] text-muted-foreground', children: note })
+        : null,
+      jsx(Button, {
+        size: 'xs',
+        variant: 'secondary',
+        disabled: busy || !text.trim(),
+        onClick: submit,
+        children: busy ? spinIcon('sync') : 'Start'
+      })
+    ]
+  })
+}
+
+/** One approval flood per session collapses to a single resolve-all bar. */
+function ApproveAllBar({ sessionId, title, items }) {
+  const [busy, setBusy] = useState(false)
+  const sample = items[0]
+  const approveAll = async () => {
+    setBusy(true)
+    try {
+      await respondAllForSession(sample, 'once')
+      haptic('submit')
+      invalidate()
+    } catch {} finally {
+      setBusy(false)
+    }
+  }
+  return jsxs('div', {
+    className:
+      'flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-1.5 text-[0.72rem]',
+    children: [
+      jsx(Codicon, { name: 'check-all', className: 'text-amber-500' }),
+      jsxs('span', {
+        className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
+        children: [`${items.length} approvals waiting in `, jsx('span', { className: 'font-medium', children: title })]
+      }),
+      jsx(Button, { size: 'xs', variant: 'secondary', disabled: busy, onClick: approveAll, children: busy ? spinIcon('sync') : 'Allow all' })
+    ]
+  })
+}
+
+// ---------------------------------------------------------------------------
 // page
 // ---------------------------------------------------------------------------
+
+const greeting = () => {
+  const h = new Date().getHours()
+  if (h < 5) return 'Up late?'
+  if (h < 12) return 'Good morning'
+  if (h < 17) return 'Good afternoon'
+  return 'Good evening'
+}
 
 function DayPage() {
   const scan = useQuery({ queryKey: SCAN_QK, queryFn: scanInbox, refetchInterval: 5000, staleTime: 1500, refetchOnWindowFocus: true })
@@ -843,6 +1051,17 @@ function DayPage() {
   const waiting = (data && data.waiting) || []
   const sources = (data && data.sources) || []
   const jobs = (cron.data && cron.data.jobs) || []
+  const hiddenCount = (data && data.hiddenCount) || 0
+  const mutedMap = useValue($muted)
+  const prefs = useValue($prefs)
+
+  // group approvals by session for the resolve-all bar
+  const approvalsBySession = {}
+  for (const n of needs) {
+    if (n.kind !== 'approval') continue
+    ;(approvalsBySession[n.sessionId] = approvalsBySession[n.sessionId] || []).push(n)
+  }
+  const floodSessions = Object.entries(approvalsBySession).filter(([, items]) => items.length > 1)
 
   const dateStr = new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })
 
@@ -860,7 +1079,7 @@ function DayPage() {
           jsxs('div', {
             className: 'flex min-w-0 items-baseline gap-3',
             children: [
-              jsx('h1', { className: 'text-lg font-semibold tracking-tight', children: 'Day' }),
+              jsx('h1', { className: 'text-lg font-semibold tracking-tight', children: `${greeting()}` }),
               jsx('span', { className: 'truncate text-[0.75rem] text-muted-foreground', children: dateStr })
             ]
           }),
@@ -881,6 +1100,15 @@ function DayPage() {
               flight.length ? jsx(Badge, { variant: 'muted', children: `${flight.length} in flight` }) : null,
               finished.length ? jsx(Badge, { variant: 'muted', children: `${finished.length} to review` }) : null,
               jsx(Tip, {
+                label: prefs.notify ? 'Notifications on — click to mute' : 'Notifications off — click to enable',
+                children: jsx(Button, {
+                  size: 'icon-sm',
+                  variant: 'ghost',
+                  onClick: () => setNotifyPref(!prefs.notify),
+                  children: jsx(Codicon, { name: prefs.notify ? 'bell' : 'bell-slash', className: prefs.notify ? '' : 'text-muted-foreground/50' })
+                })
+              }),
+              jsx(Tip, {
                 label: 'Refresh',
                 children: jsx(Button, {
                   size: 'icon-sm',
@@ -892,6 +1120,10 @@ function DayPage() {
             ]
           })
         ]
+      }),
+      jsxs('div', {
+        className: 'mx-auto w-full max-w-6xl shrink-0 px-6 pt-4',
+        children: [jsx(QuickTaskBar, {})]
       }),
       jsx(ScrollArea, {
         className: 'min-h-0 flex-1',
@@ -914,13 +1146,32 @@ function DayPage() {
                   ? jsxs('section', {
                       children: [
                         jsx(SectionLabel, { icon: 'bell-dot', title: 'Needs you', count: needs.length, tone: 'text-amber-500' }),
+                        floodSessions.length
+                          ? jsx('div', {
+                              className: 'mb-2 flex flex-col gap-1.5',
+                              children: floodSessions.map(([sid, items]) =>
+                                jsx(ApproveAllBar, { sessionId: sid, title: items[0].title, items }, `flood-${sid}`)
+                              )
+                            })
+                          : null,
                         jsx('div', {
                           className: 'flex flex-col gap-2.5',
                           children: needs.map(item => jsx(NeedsYouCard, { item }, item.key))
-                        })
+                        }),
+                        hiddenCount
+                          ? jsxs('div', {
+                              className: 'mt-2 px-1 text-[0.68rem] text-muted-foreground/60',
+                              children: [`${hiddenCount} item${hiddenCount === 1 ? '' : 's'} snoozed or from muted sources`]
+                            })
+                          : null
                       ]
                     })
-                  : null,
+                  : hiddenCount
+                    ? jsxs('div', {
+                        className: 'px-1 text-[0.68rem] text-muted-foreground/60',
+                        children: [`${hiddenCount} item${hiddenCount === 1 ? '' : 's'} snoozed or from muted sources`]
+                      })
+                    : null,
                 waiting.length
                   ? jsxs('section', {
                       children: [
@@ -969,22 +1220,35 @@ function DayPage() {
                     jsx(SectionLabel, { icon: 'server-environment', title: 'Sources', count: sources.length }),
                     jsx('div', {
                       className: 'flex flex-col gap-1',
-                      children: sources.map(s =>
-                        jsxs(
+                      children: sources.map(s => {
+                        const muted = Boolean(mutedMap[s.key])
+                        return jsxs(
                           'div',
                           {
-                            className: 'flex items-center gap-2 px-2 py-1 text-[0.72rem]',
+                            className: cn('flex items-center gap-2 px-2 py-1 text-[0.72rem]', muted && 'opacity-50'),
                             children: [
                               jsx('span', {
                                 className: cn('size-1.5 rounded-full', s.unreachable ? 'bg-destructive' : 'bg-emerald-500')
                               }),
                               jsx('span', { className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)', children: s.label }),
-                              s.unreachable ? jsx(Tip, { label: s.unreachable, children: jsx(Codicon, { name: 'warning', className: 'text-amber-500' }) }) : null
+                              s.unreachable ? jsx(Tip, { label: s.unreachable, children: jsx(Codicon, { name: 'warning', className: 'text-amber-500' }) }) : null,
+                              jsx(Tip, {
+                                label: muted ? 'Unmute — show its waiting items again' : 'Mute — hide its waiting items',
+                                children: jsx(Button, {
+                                  size: 'icon-xs',
+                                  variant: 'ghost',
+                                  onClick: () => {
+                                    toggleMute(s.key)
+                                    invalidate()
+                                  },
+                                  children: jsx(Codicon, { name: muted ? 'bell-slash' : 'bell' })
+                                })
+                              })
                             ]
                           },
                           s.key
                         )
-                      )
+                      })
                     })
                   ]
                 })
@@ -1034,7 +1298,11 @@ export default {
 
   register(ctx) {
     storageRef = ctx.storage
+    notifyRef = (ctx.os && typeof ctx.os.notify === 'function') ? ctx.os : null
     $finished.set(loadFinished())
+    $muted.set(loadMap(MUTED_KEY))
+    $snoozed.set(loadMap(SNOOZE_KEY))
+    $prefs.set({ notify: true, ...loadMap(PREFS_KEY) })
 
     ctx.onEvent('message.complete', ev => recordFinished(ev, 'done'))
     ctx.onEvent('error', ev => recordFinished(ev, 'error'))
