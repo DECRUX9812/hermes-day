@@ -17,7 +17,13 @@ tags:
   - approvals
   - day-management
 provides_tools: []
-provides_hooks: []
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - pre_verify
+  - on_session_finalize
 provides_middleware: []
 requires_env: []
-config_schema: {}
+config_schema:
+  gate:
+    type: object

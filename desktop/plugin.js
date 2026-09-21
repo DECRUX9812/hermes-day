@@ -114,6 +114,10 @@ const $triage = atom({ date: '', count: 0 })
 const $prompts = atom(null)
 /** last dismissed finished item — powers the undo chip */
 const $undo = atom(null)
+
+// evidence gate verdicts from the agent half (pre_tool_call/post_tool_call/
+// pre_verify); key: `${sourceKey}#${session_key}`, value: {verdict, detail, ...}
+const $evidence = atom({})
 /** sessionKey -> recent latest_seq samples — the in-flight heartbeat */
 const seqHist = new Map()
 const SPARK_LEN = 14
@@ -289,6 +293,22 @@ async function scanRoute(route) {
   )
 
   for (const k of seqHist.keys()) if (k.startsWith(source.key + '#') && !seenKeys.has(k)) seqHist.delete(k)
+
+  // Evidence-gate verdicts from the agent half, if installed — one plugin
+  // command dispatch per route, keyed by durable session_key.
+  try {
+    const disp = await rpc(route, 'command.dispatch', { name: 'day-evidence', arg: '' })
+    const out = disp && (disp.output || disp.text || '')
+    const parsed = out && out.trim().startsWith('{') ? JSON.parse(out) : null
+    const sessions = parsed && parsed.sessions
+    if (sessions && typeof sessions === 'object') {
+      const ev = { ...$evidence.get() }
+      for (const [k, v] of Object.entries(sessions)) {
+        if (v && v.verdict) ev[`${source.key}#${k}`] = v
+      }
+      $evidence.set(ev)
+    }
+  } catch {}
 
   // forget request ids that resolved between scans so re-asks re-stamp
   if (firstSeen.size > 400) {
@@ -1231,8 +1251,37 @@ function FlightRow({ row }) {
   })
 }
 
+const EVIDENCE_BADGE = {
+  verified: { icon: 'shield', color: () => C.emerald, label: () => 'verified' },
+  missing: { icon: 'question', color: () => C.amber, label: () => 'no evidence' },
+  failed: { icon: 'flame', color: () => C.red, label: () => 'checks failed' },
+  flagged: { icon: 'warning', color: () => C.red, label: ev => `guard x${ev.blocks || 1}` }
+}
+
+function EvidenceBadge({ ev }) {
+  const m = EVIDENCE_BADGE[ev && ev.verdict]
+  if (!m) return null
+  const color = m.color(ev)
+  const label = m.label(ev)
+  return jsx(Tip, {
+    label: `Evidence gate — ${ev.detail || label}`,
+    children: jsxs('span', {
+      className: 'inline-flex shrink-0 items-center gap-1 rounded border px-1 py-px text-[0.62rem] font-mono',
+      style: { color, borderColor: `${color}44`, background: `${color}14` },
+      children: [jsx(Codicon, { name: m.icon, className: 'text-[0.66rem]' }), label]
+    })
+  })
+}
+
+function evidenceFor(f, map) {
+  if (!f.storedId) return null
+  const scoped = `${f.route ? routeKey(f.route) : 'local'}#${f.storedId}`
+  return map[scoped] || map[f.storedId] || null
+}
+
 function FinishedRow({ f }) {
   const [busy, setBusy] = useState(false)
+  const evMap = useValue($evidence)
   const [nudging, setNudging] = useState(false)
   const [nudgeText, setNudgeText] = useState('')
   const [note, setNote] = useState('')
@@ -1296,6 +1345,7 @@ function FinishedRow({ f }) {
             ]
           }),
           f.profile ? jsx(SourcePill, { label: f.profile }) : null,
+          jsx(EvidenceBadge, { ev: evidenceFor(f, evMap) }),
           jsx(AgoText, { ms: f.at }),
           f.storedId
             ? jsx(Tip, {

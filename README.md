@@ -48,6 +48,19 @@ Cards that sit unanswered for 10+ minutes start **breathing** (a slow red ring
 pulse) and the oldest open item wears a "waiting longest" flame chip — the board
 nags you where your attention is most overdue.
 
+## Evidence gate + honesty guard (agent half)
+
+The repo is now a dual-half plugin — `__init__.py` registers backend hooks next
+to the desktop surface:
+
+| Piece | What it does |
+| --- | --- |
+| **Completion gate** (`pre_verify`) | When a session edited files and tries to finish without a passing test/check run, the turn is nudged back to produce real evidence (self-throttled inside the framework's verify budget). |
+| **Honesty guard** (`pre_tool_call`) | Vetoes tool calls that fake a pass: deleting/reverting/truncating test files, in-place `sed` on tests, gutting assertions via file edits, `--passWithNoTests`-style flags, `|| true` exit laundering. |
+| **Evidence badges** (`/day-evidence` + `post_tool_call`) | Finished rows in the cockpit carry a verdict chip — `verified` (exit 0), `no evidence`, `checks failed`, or `guard ×N` when the agent tried to cheat. |
+
+No LLM in the loop — every check is deterministic.
+
 ## Stay in flow
 
 - **Quick-task bar** — type what you want done, hit Enter: the plugin creates the session and submits the prompt without leaving the board.
