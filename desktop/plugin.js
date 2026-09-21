@@ -14,10 +14,14 @@ import {
   Badge,
   Button,
   Codicon,
-  EmptyState,
   Input,
+  Kbd,
   Loader,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   ScrollArea,
+  SearchField,
   SessionStatusDot,
   Tip,
   KEYBINDS_AREA,
@@ -102,6 +106,8 @@ const $muted = atom({})
 const $snoozed = atom({})
 /** user prefs — { notify: boolean } */
 const $prefs = atom({ notify: true })
+/** pinned sessions — storedId -> { storedId, title, route, profile, at } */
+const $pinned = atom({})
 /** request ids already notified about this app session */
 const notified = new Set()
 /** first scan seeds `notified` silently — no burst on app start */
@@ -112,6 +118,15 @@ const SNOOZE_MS = 15 * 60 * 1000
 const MUTED_KEY = 'muted.v1'
 const SNOOZE_KEY = 'snoozed.v1'
 const PREFS_KEY = 'prefs.v1'
+const PINNED_KEY = 'pinned.v1'
+
+/** kind -> accent color + icon + label — the card's identity at a glance */
+const KIND_STYLE = {
+  approval: { icon: 'shield', label: 'Approval', color: '#f59e0b' },
+  clarify: { icon: 'comment-discussion', label: 'Question', color: '#3b82f6' },
+  input: { icon: 'keyboard', label: 'Input', color: '#a855f7' },
+  other: { icon: 'question', label: 'Request', color: '#8b949e' }
+}
 
 const routeKey = route =>
   route ? `${route.connectionId ?? ''}/${route.profile ?? ''}/${route.targetProfile ?? ''}` : 'local'
@@ -314,11 +329,30 @@ const toggleMute = key => {
   persistMap(MUTED_KEY, next)
 }
 
-const snoozeRequest = requestId => {
-  const next = { ...$snoozed.get(), [requestId]: Date.now() + SNOOZE_MS }
+const snoozeRequest = (requestId, ms = SNOOZE_MS) => {
+  const next = { ...$snoozed.get(), [requestId]: Date.now() + ms }
   $snoozed.set(next)
   persistMap(SNOOZE_KEY, next)
   invalidate()
+}
+
+const snoozePresets = () => {
+  const nine = new Date()
+  nine.setHours(9, 0, 0, 0)
+  if (nine.getTime() <= Date.now()) nine.setDate(nine.getDate() + 1)
+  return [
+    { label: '15 minutes', ms: 15 * 60 * 1000 },
+    { label: '1 hour', ms: 60 * 60 * 1000 },
+    { label: 'Tomorrow, 9 am', ms: nine.getTime() - Date.now() }
+  ]
+}
+
+const togglePin = (storedId, info) => {
+  const next = { ...$pinned.get() }
+  if (next[storedId]) delete next[storedId]
+  else next[storedId] = { storedId, title: info.title || 'Session', route: info.route || null, profile: info.profile || null, at: Date.now() }
+  $pinned.set(next)
+  persistMap(PINNED_KEY, next)
 }
 
 const setNotifyPref = on => {
@@ -428,6 +462,16 @@ async function respondAllForSession(item, choice) {
   })
 }
 
+/** Stop a running turn in place. */
+async function interruptSession(route, sessionId) {
+  await rpc(route, 'session.interrupt', { session_id: sessionId })
+}
+
+/** Send a follow-up prompt to a live session without leaving the board. */
+async function nudgeSession(route, sessionId, text) {
+  await rpc(route, 'prompt.submit', { session_id: sessionId, text })
+}
+
 async function openItemSession(item) {
   const target = item.storedId || item.sessionId
   const opts = {
@@ -490,10 +534,46 @@ const spinIcon = name => jsx(Codicon, { name, spinning: true, className: 'text-[
 // needs-you cards
 // ---------------------------------------------------------------------------
 
-function NeedsYouCard({ item }) {
+function SnoozeMenu({ requestId, busy }) {
+  const [openMenu, setOpenMenu] = useState(false)
+  return jsxs(Popover, {
+    open: openMenu,
+    onOpenChange: setOpenMenu,
+    children: [
+      jsx(PopoverTrigger, {
+        children: jsx(Tip, {
+          label: 'Snooze',
+          children: jsx(Button, {
+            size: 'icon-xs',
+            variant: 'ghost',
+            disabled: Boolean(busy),
+            children: jsx(Codicon, { name: 'snooze' })
+          })
+        })
+      }),
+      jsx(PopoverContent, {
+        align: 'end',
+        className: 'w-40 p-1',
+        children: snoozePresets().map(p =>
+          jsx('button', {
+            type: 'button',
+            className:
+              'flex w-full items-center gap-2 rounded-[0.25rem] px-2 py-1.5 text-left text-[0.75rem] hover:bg-(--chrome-action-hover)',
+            onClick: () => {
+              snoozeRequest(requestId, p.ms)
+              setOpenMenu(false)
+            },
+            children: p.label
+          }, p.label)
+        )
+      })
+    ]
+  })
+}
+
+function NeedsYouCard({ item, selected }) {
   const [busy, setBusy] = useState('')
   const [failed, setFailed] = useState('')
-  const [, forceTick] = useState(0)
 
   const run = useCallback(
     async (tag, fn) => {
@@ -518,26 +598,21 @@ function NeedsYouCard({ item }) {
       await openItemSession(item)
     })
 
+  const accent = KIND_STYLE[item.kind] || KIND_STYLE.other
+
   const header = jsxs('div', {
     className: 'flex min-w-0 items-center gap-2',
     children: [
       item.storedId ? jsx(SessionStatusDot, { storedSessionId: item.storedId }) : jsx(Codicon, { name: 'comment', className: 'text-muted-foreground' }),
+      jsxs('span', {
+        className: 'inline-flex shrink-0 items-center gap-1 rounded-[3px] px-1.5 py-px text-[0.62rem] font-semibold',
+        style: { color: accent.color, background: `${accent.color}1f` },
+        children: [jsx(Codicon, { name: accent.icon, size: 11 }), accent.label]
+      }),
       jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.82rem] font-semibold', children: item.title }),
       jsx(SourcePill, { label: item.sourceLabel }),
       jsx(AgoText, { ms: item.firstSeenAt }),
-      jsx(Tip, {
-        label: 'Snooze 15 min',
-        children: jsx(Button, {
-          size: 'icon-xs',
-          variant: 'ghost',
-          disabled: Boolean(busy),
-          onClick: () => {
-            snoozeRequest(item.requestId)
-            forceTick(t => t + 1)
-          },
-          children: jsx(Codicon, { name: 'snooze' })
-        })
-      })
+      jsx(SnoozeMenu, { requestId: item.requestId, busy })
     ]
   })
 
@@ -548,9 +623,25 @@ function NeedsYouCard({ item }) {
 
   return jsxs('div', {
     className: 'rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary) p-3 shadow-sm',
+    style: {
+      borderLeft: `3px solid ${accent.color}`,
+      ...(selected ? { boxShadow: `0 0 0 2px ${accent.color}55` } : null)
+    },
     children: [
       header,
       body,
+      selected
+        ? jsxs('div', {
+            className: 'mt-2 flex items-center gap-2.5 text-[0.65rem] text-muted-foreground/80',
+            children: [
+              jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'j/k' }), 'move'] }),
+              item.kind === 'approval' ? jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'a' }), 'allow once'] }) : null,
+              item.kind === 'approval' ? jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'd' }), 'deny'] }) : null,
+              jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 's' }), 'snooze'] }),
+              jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'o' }), 'open'] })
+            ]
+          })
+        : null,
       failed
         ? jsxs('div', {
             className: 'mt-2 flex items-center gap-1.5 text-[0.7rem] text-destructive',
@@ -823,6 +914,13 @@ function GenericRequestBody({ item, busy, open }) {
 function FlightRow({ row }) {
   const s = row.session
   const [busy, setBusy] = useState(false)
+  const [nudging, setNudging] = useState(false)
+  const [nudgeText, setNudgeText] = useState('')
+  const [note, setNote] = useState('')
+  const pinnedMap = useValue($pinned)
+  const pinned = Boolean(s.session_key && pinnedMap[s.session_key])
+  const running = FLIGHT.has(s.status)
+
   const open = async () => {
     setBusy(true)
     try {
@@ -831,33 +929,133 @@ function FlightRow({ row }) {
       setBusy(false)
     }
   }
-  return jsxs('button', {
-    type: 'button',
-    onClick: open,
+
+  const nudge = async () => {
+    const t = nudgeText.trim()
+    if (!t) return
+    setNote('')
+    try {
+      await nudgeSession(row.route, s.id, t)
+      setNudgeText('')
+      setNudging(false)
+      setNote('Sent')
+      haptic('submit')
+      invalidate()
+    } catch (err) {
+      setNote(errMsg(err))
+      haptic('cancel')
+    }
+  }
+
+  const stop = async ev => {
+    ev.stopPropagation()
+    setNote('')
+    try {
+      await interruptSession(row.route, s.id)
+      haptic('cancel')
+      invalidate()
+    } catch (err) {
+      setNote(errMsg(err))
+    }
+  }
+
+  return jsxs('div', {
     className:
-      'group flex w-full items-center gap-2.5 rounded-md border border-transparent px-2 py-1.5 text-left transition-colors hover:border-(--ui-stroke-secondary) hover:bg-(--ui-bg-secondary)',
+      'group rounded-md border border-transparent transition-colors hover:border-(--ui-stroke-secondary) hover:bg-(--ui-bg-secondary)',
     children: [
-      s.session_key
-        ? jsx(SessionStatusDot, { storedSessionId: s.session_key })
-        : jsx('span', { className: 'size-1.5 rounded-full bg-emerald-500' }),
       jsxs('div', {
-        className: 'min-w-0 flex-1',
+        className: 'flex w-full cursor-pointer items-center gap-2.5 px-2 py-1.5',
+        onClick: open,
         children: [
-          jsx('div', { className: 'truncate text-[0.78rem] font-medium text-(--ui-text-primary)', children: s.title || 'Session' }),
-          s.preview
-            ? jsx('div', { className: 'truncate text-[0.68rem] text-muted-foreground', children: s.preview })
-            : null
+          s.session_key
+            ? jsx(SessionStatusDot, { storedSessionId: s.session_key })
+            : jsx('span', { className: 'size-1.5 rounded-full bg-emerald-500' }),
+          jsxs('div', {
+            className: 'min-w-0 flex-1',
+            children: [
+              jsx('div', { className: 'truncate text-[0.78rem] font-medium text-(--ui-text-primary)', children: s.title || 'Session' }),
+              s.preview
+                ? jsx('div', { className: 'truncate text-[0.68rem] text-muted-foreground', children: s.preview })
+                : null
+            ]
+          }),
+          jsx(SourcePill, { label: row.sourceLabel }),
+          jsx(AgoText, { ms: epochMs(s.last_active) }),
+          s.session_key
+            ? jsx(Tip, {
+                label: pinned ? 'Unpin' : 'Pin to Watching',
+                children: jsx(Button, {
+                  size: 'icon-xs',
+                  variant: 'ghost',
+                  className: pinned ? '' : 'opacity-0 group-hover:opacity-100',
+                  onClick: ev => {
+                    ev.stopPropagation()
+                    togglePin(s.session_key, { title: s.title, route: row.route })
+                    haptic('selection')
+                  },
+                  children: jsx(Codicon, { name: pinned ? 'pinned' : 'pin' })
+                })
+              })
+            : null,
+          jsx(Tip, {
+            label: 'Send a follow-up',
+            children: jsx(Button, {
+              size: 'icon-xs',
+              variant: 'ghost',
+              className: nudging ? '' : 'opacity-0 group-hover:opacity-100',
+              onClick: ev => {
+                ev.stopPropagation()
+                setNudging(v => !v)
+              },
+              children: jsx(Codicon, { name: 'comment' })
+            })
+          }),
+          running
+            ? jsx(Tip, {
+                label: 'Stop the running turn',
+                children: jsx(Button, {
+                  size: 'icon-xs',
+                  variant: 'ghost',
+                  className: 'opacity-0 group-hover:opacity-100',
+                  onClick: stop,
+                  children: jsx(Codicon, { name: 'debug-stop' })
+                })
+              })
+            : null,
+          busy ? spinIcon('sync') : jsx(Codicon, { name: 'arrow-right', className: 'text-muted-foreground/40 group-hover:text-muted-foreground' })
         ]
       }),
-      jsx(SourcePill, { label: row.sourceLabel }),
-      jsx(AgoText, { ms: epochMs(s.last_active) }),
-      busy ? spinIcon('sync') : jsx(Codicon, { name: 'arrow-right', className: 'text-muted-foreground/40 group-hover:text-muted-foreground' })
+      nudging
+        ? jsxs('div', {
+            className: 'flex items-center gap-1.5 px-2 pb-2 pl-8',
+            children: [
+              jsx(Input, {
+                value: nudgeText,
+                placeholder: 'Reply without opening the session…',
+                onChange: ev => setNudgeText(ev.target.value),
+                onKeyDown: ev => {
+                  ev.stopPropagation()
+                  if (isSubmitEnter(ev)) nudge()
+                },
+                className: 'h-7 flex-1 text-[0.78rem]'
+              }),
+              jsx(Button, { size: 'xs', variant: 'secondary', disabled: !nudgeText.trim(), onClick: nudge, children: 'Send' })
+            ]
+          })
+        : null,
+      note ? jsx('div', { className: 'px-2 pb-1.5 pl-8 text-[0.68rem] text-muted-foreground', children: note }) : null
     ]
   })
 }
 
 function FinishedRow({ f }) {
   const [busy, setBusy] = useState(false)
+  const [nudging, setNudging] = useState(false)
+  const [nudgeText, setNudgeText] = useState('')
+  const [note, setNote] = useState('')
+  const pinnedMap = useValue($pinned)
+  const pinned = Boolean(f.storedId && pinnedMap[f.storedId])
+
   const review = async () => {
     setBusy(true)
     try {
@@ -876,35 +1074,104 @@ function FinishedRow({ f }) {
       setBusy(false)
     }
   }
+
+  const nudge = async () => {
+    const t = nudgeText.trim()
+    if (!t || !f.runtimeId) return
+    setNote('')
+    try {
+      await nudgeSession(f.route, f.runtimeId, t)
+      setNudgeText('')
+      setNudging(false)
+      setNote('Sent — session resumed')
+      haptic('submit')
+      invalidate()
+    } catch (err) {
+      setNote(errMsg(err))
+      haptic('cancel')
+    }
+  }
+
   return jsxs('div', {
-    className: 'flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 hover:bg-(--ui-bg-secondary)',
+    className: 'group rounded-md hover:bg-(--ui-bg-secondary)',
     children: [
-      jsx(Codicon, {
-        name: f.kind === 'error' ? 'error' : 'pass-filled',
-        className: cn('shrink-0 text-[0.8rem]', f.kind === 'error' ? 'text-destructive' : 'text-emerald-500')
-      }),
       jsxs('div', {
-        className: 'min-w-0 flex-1',
+        className: 'flex w-full items-center gap-2.5 px-2 py-1.5',
         children: [
-          jsx('div', { className: 'truncate text-[0.78rem] font-medium text-(--ui-text-primary)', children: f.title || 'Session' }),
-          jsx('div', {
-            className: 'truncate text-[0.68rem] text-muted-foreground',
-            children: f.kind === 'error' ? 'Ended with an error' : 'Turn finished'
+          jsx(Codicon, {
+            name: f.kind === 'error' ? 'error' : 'pass-filled',
+            className: cn('shrink-0 text-[0.8rem]', f.kind === 'error' ? 'text-destructive' : 'text-emerald-500')
+          }),
+          jsxs('div', {
+            className: 'min-w-0 flex-1',
+            children: [
+              jsx('div', { className: 'truncate text-[0.78rem] font-medium text-(--ui-text-primary)', children: f.title || 'Session' }),
+              jsx('div', {
+                className: 'truncate text-[0.68rem] text-muted-foreground',
+                children: f.kind === 'error' ? 'Ended with an error' : 'Turn finished'
+              })
+            ]
+          }),
+          f.profile ? jsx(SourcePill, { label: f.profile }) : null,
+          jsx(AgoText, { ms: f.at }),
+          f.storedId
+            ? jsx(Tip, {
+                label: pinned ? 'Unpin' : 'Pin to Watching',
+                children: jsx(Button, {
+                  size: 'icon-xs',
+                  variant: 'ghost',
+                  className: pinned ? '' : 'opacity-0 group-hover:opacity-100',
+                  onClick: () => {
+                    togglePin(f.storedId, { title: f.title, route: f.route, profile: f.profile })
+                    haptic('selection')
+                  },
+                  children: jsx(Codicon, { name: pinned ? 'pinned' : 'pin' })
+                })
+              })
+            : null,
+          f.runtimeId
+            ? jsx(Tip, {
+                label: 'Send a follow-up',
+                children: jsx(Button, {
+                  size: 'icon-xs',
+                  variant: 'ghost',
+                  className: nudging ? '' : 'opacity-0 group-hover:opacity-100',
+                  onClick: () => setNudging(v => !v),
+                  children: jsx(Codicon, { name: 'comment' })
+                })
+              })
+            : null,
+          jsx(Button, { size: 'xs', variant: 'outline', disabled: busy, onClick: review, children: busy ? spinIcon('sync') : 'Review' }),
+          jsx(Tip, {
+            label: 'Dismiss',
+            children: jsx(Button, {
+              size: 'icon-xs',
+              variant: 'ghost',
+              onClick: () => dismissFinished(f.key),
+              children: jsx(Codicon, { name: 'close' })
+            })
           })
         ]
       }),
-      f.profile ? jsx(SourcePill, { label: f.profile }) : null,
-      jsx(AgoText, { ms: f.at }),
-      jsx(Button, { size: 'xs', variant: 'outline', disabled: busy, onClick: review, children: busy ? spinIcon('sync') : 'Review' }),
-      jsx(Tip, {
-        label: 'Dismiss',
-        children: jsx(Button, {
-          size: 'icon-xs',
-          variant: 'ghost',
-          onClick: () => dismissFinished(f.key),
-          children: jsx(Codicon, { name: 'close' })
-        })
-      })
+      nudging
+        ? jsxs('div', {
+            className: 'flex items-center gap-1.5 px-2 pb-2 pl-8',
+            children: [
+              jsx(Input, {
+                value: nudgeText,
+                placeholder: 'Follow up — resumes this session…',
+                onChange: ev => setNudgeText(ev.target.value),
+                onKeyDown: ev => {
+                  ev.stopPropagation()
+                  if (isSubmitEnter(ev)) nudge()
+                },
+                className: 'h-7 flex-1 text-[0.78rem]'
+              }),
+              jsx(Button, { size: 'xs', variant: 'secondary', disabled: !nudgeText.trim(), onClick: nudge, children: 'Send' })
+            ]
+          })
+        : null,
+      note ? jsx('div', { className: 'px-2 pb-1.5 pl-8 text-[0.68rem] text-muted-foreground', children: note }) : null
     ]
   })
 }
@@ -1040,20 +1307,185 @@ const greeting = () => {
   return 'Good evening'
 }
 
+// ---------------------------------------------------------------------------
+// day-arc hero + inbox-zero confetti
+// ---------------------------------------------------------------------------
+
+/** Sun position along the day arc — 6 am rises left, 6 pm sets right. */
+function DayArc() {
+  const now = new Date()
+  const mins = now.getHours() * 60 + now.getMinutes()
+  const t = Math.min(1, Math.max(0, (mins - 360) / 720))
+  const x = 12 + 176 * t
+  const y = 46 - Math.sin(t * Math.PI) * 34
+  return jsxs('svg', {
+    width: 200,
+    height: 52,
+    viewBox: '0 0 200 52',
+    className: 'shrink-0 opacity-90',
+    'aria-hidden': true,
+    children: [
+      jsx('path', { d: 'M12 46 Q100 -16 188 46', fill: 'none', stroke: 'var(--ui-stroke-secondary)', strokeWidth: 1.5 }),
+      jsx('line', { x1: 4, y1: 46, x2: 196, y2: 46, stroke: 'var(--ui-stroke-secondary)', strokeWidth: 1 }),
+      jsx('circle', { cx: x, cy: y, r: 10, fill: '#f59e0b', fillOpacity: 0.15 }),
+      jsx('circle', { cx: x, cy: y, r: 4.5, fill: '#f59e0b' }),
+      jsx('text', { x: 12, y: 12, fontSize: 8, fill: 'var(--ui-text-tertiary)', children: '6a' }),
+      jsx('text', { x: 96, y: 4, fontSize: 8, fill: 'var(--ui-text-tertiary)', children: '12p' }),
+      jsx('text', { x: 182, y: 12, fontSize: 8, fill: 'var(--ui-text-tertiary)', children: '6p' })
+    ]
+  })
+}
+
+const CONFETTI_COLORS = ['#f59e0b', '#10b981', '#3b82f6', '#a855f7', '#ec4899']
+
+function Confetti({ onDone }) {
+  const pieces = useMemo(
+    () =>
+      Array.from({ length: 64 }, (_, i) => ({
+        left: 2 + Math.random() * 96,
+        delay: Math.random() * 0.5,
+        dur: 1.5 + Math.random() * 0.9,
+        size: 5 + Math.random() * 6,
+        color: CONFETTI_COLORS[i % CONFETTI_COLORS.length],
+        round: Math.random() > 0.5
+      })),
+    []
+  )
+  useEffect(() => {
+    const t = setTimeout(onDone, 2600)
+    return () => clearTimeout(t)
+  }, [])
+  return jsxs('div', {
+    className: 'pointer-events-none fixed inset-0 z-50 overflow-hidden',
+    children: [
+      jsx('style', {
+        children:
+          '@keyframes hday-confetti{0%{transform:translateY(-6vh) rotate(0);opacity:1}85%{opacity:1}100%{transform:translateY(105vh) rotate(680deg);opacity:0}}'
+      }),
+      pieces.map((p, i) =>
+        jsx('div', {
+          style: {
+            position: 'absolute',
+            top: '-6vh',
+            left: `${p.left}%`,
+            width: p.size,
+            height: p.size * (p.round ? 1 : 0.6),
+            background: p.color,
+            borderRadius: p.round ? '50%' : '1.5px',
+            animation: `hday-confetti ${p.dur}s cubic-bezier(.2,.7,.4,1) ${p.delay}s forwards`
+          }
+        }, i)
+      )
+    ]
+  })
+}
+
+// ---------------------------------------------------------------------------
+// watching — pinned sessions rail
+// ---------------------------------------------------------------------------
+
+function WatchingRow({ entry }) {
+  const [busy, setBusy] = useState(false)
+  const open = async () => {
+    setBusy(true)
+    try {
+      await host.openSession(entry.storedId, {
+        ...(entry.route ? { route: entry.route, profile: entry.route.targetProfile } : {}),
+        awaitHydration: true,
+        retryHydrationTimeoutOnce: true
+      })
+    } catch {} finally {
+      setBusy(false)
+    }
+  }
+  return jsxs('div', {
+    className: 'group flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-[0.72rem] hover:bg-(--ui-bg-secondary)',
+    onClick: open,
+    children: [
+      jsx(SessionStatusDot, { storedSessionId: entry.storedId }),
+      jsx('span', { className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)', children: entry.title }),
+      busy ? spinIcon('sync') : null,
+      jsx(Button, {
+        size: 'icon-xs',
+        variant: 'ghost',
+        className: 'opacity-0 group-hover:opacity-100',
+        onClick: ev => {
+          ev.stopPropagation()
+          togglePin(entry.storedId, {})
+        },
+        children: jsx(Codicon, { name: 'pinned' })
+      })
+    ]
+  })
+}
+
 function DayPage() {
   const scan = useQuery({ queryKey: SCAN_QK, queryFn: scanInbox, refetchInterval: 5000, staleTime: 1500, refetchOnWindowFocus: true })
   const cron = useQuery({ queryKey: CRON_QK, queryFn: scanCron, refetchInterval: 30000, staleTime: 10000, refetchOnWindowFocus: true })
-  const finished = useValue($finished)
+  const finishedAll = useValue($finished)
+  const [filter, setFilter] = useState('')
+  const [sel, setSel] = useState(0)
+  const [celebrate, setCelebrate] = useState(false)
+  const prevNeeds = useRef(null)
+  const pinnedMap = useValue($pinned)
 
   const data = scan.data
-  const needs = (data && data.needs) || []
-  const flight = (data && data.flight) || []
-  const waiting = (data && data.waiting) || []
+  const q = filter.trim().toLowerCase()
+  const match = t => !q || String(t || '').toLowerCase().includes(q)
+  const needs = ((data && data.needs) || []).filter(n => match(n.title) || match(n.preview) || match(n.method))
+  const flight = ((data && data.flight) || []).filter(r => match(r.session.title) || match(r.session.preview))
+  const waiting = ((data && data.waiting) || []).filter(r => match(r.session.title) || match(r.session.preview))
+  const finished = finishedAll.filter(f => match(f.title))
   const sources = (data && data.sources) || []
   const jobs = (cron.data && cron.data.jobs) || []
   const hiddenCount = (data && data.hiddenCount) || 0
   const mutedMap = useValue($muted)
   const prefs = useValue($prefs)
+  const watching = Object.values(pinnedMap).sort((a, b) => b.at - a.at)
+
+  // clamp keyboard selection to the visible queue
+  useEffect(() => {
+    if (sel >= needs.length) setSel(Math.max(0, needs.length - 1))
+  }, [needs.length])
+
+  // inbox-zero confetti — only on a real transition, never on first paint
+  useEffect(() => {
+    if (prevNeeds.current !== null && prevNeeds.current > 0 && needs.length === 0) {
+      setCelebrate(true)
+      haptic('submit')
+    }
+    prevNeeds.current = needs.length
+  }, [needs.length])
+
+  // j/k/a/d/s/o triage — live only while this route is foreground and not typing
+  useEffect(() => {
+    const onKey = ev => {
+      if (!location.hash.includes(DAY_PATH)) return
+      const t = ev.target
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return
+      const item = needs[sel]
+      if (ev.key === 'j' || ev.key === 'ArrowDown') {
+        setSel(s => Math.min(needs.length - 1, s + 1))
+        ev.preventDefault()
+      } else if (ev.key === 'k' || ev.key === 'ArrowUp') {
+        setSel(s => Math.max(0, s - 1))
+        ev.preventDefault()
+      } else if (!item) return
+      else if (ev.key === 'a' && item.kind === 'approval') {
+        respondApproval(item, 'once').then(invalidate).catch(() => {})
+      } else if (ev.key === 'd' && item.kind === 'approval') {
+        respondApproval(item, 'deny').then(invalidate).catch(() => {})
+      } else if (ev.key === 's') {
+        snoozeRequest(item.requestId)
+      } else if (ev.key === 'o' || ev.key === 'Enter') {
+        openItemSession(item).catch(() => {})
+      } else return
+      haptic('selection')
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [needs, sel])
 
   // group approvals by session for the resolve-all bar
   const approvalsBySession = {}
@@ -1064,6 +1496,7 @@ function DayPage() {
   const floodSessions = Object.entries(approvalsBySession).filter(([, items]) => items.length > 1)
 
   const dateStr = new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })
+  const nextJob = jobs.find(j => j.enabled !== false && j.next_run_at && !Number.isNaN(Date.parse(j.next_run_at)))
 
   const refresh = () => invalidate()
 
@@ -1073,6 +1506,7 @@ function DayPage() {
   return jsxs('div', {
     className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-primary) text-(--ui-text-primary)',
     children: [
+      celebrate ? jsx(Confetti, { onDone: () => setCelebrate(false) }) : null,
       jsxs('header', {
         className: 'flex shrink-0 items-center justify-between gap-4 border-b border-(--ui-stroke-secondary) px-6 py-4',
         children: [
@@ -1083,6 +1517,7 @@ function DayPage() {
               jsx('span', { className: 'truncate text-[0.75rem] text-muted-foreground', children: dateStr })
             ]
           }),
+          jsx(DayArc, {}),
           jsxs('div', {
             className: 'flex shrink-0 items-center gap-2',
             children: [
@@ -1099,6 +1534,16 @@ function DayPage() {
                   }),
               flight.length ? jsx(Badge, { variant: 'muted', children: `${flight.length} in flight` }) : null,
               finished.length ? jsx(Badge, { variant: 'muted', children: `${finished.length} to review` }) : null,
+              nextJob
+                ? jsxs(Badge, {
+                    variant: 'outline',
+                    className: 'gap-1',
+                    children: [
+                      jsx(Codicon, { name: 'calendar' }),
+                      `next: ${nextJob.name || 'job'} · ${relativeTime(Date.parse(nextJob.next_run_at))}`
+                    ]
+                  })
+                : null,
               jsx(Tip, {
                 label: prefs.notify ? 'Notifications on — click to mute' : 'Notifications off — click to enable',
                 children: jsx(Button, {
@@ -1123,7 +1568,32 @@ function DayPage() {
       }),
       jsxs('div', {
         className: 'mx-auto w-full max-w-6xl shrink-0 px-6 pt-4',
-        children: [jsx(QuickTaskBar, {})]
+        children: [
+          jsx(QuickTaskBar, {}),
+          jsxs('div', {
+            className: 'mt-2 flex items-center gap-3 px-1',
+            children: [
+              jsx(SearchField, {
+                placeholder: 'Filter the board…',
+                value: filter,
+                onChange: setFilter,
+                containerClassName: 'w-56'
+              }),
+              needs.length
+                ? jsxs('span', {
+                    className: 'hidden items-center gap-2 text-[0.65rem] text-muted-foreground/70 lg:flex',
+                    children: [
+                      jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'j/k' }), 'select'] }),
+                      jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'a' }), 'allow'] }),
+                      jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'd' }), 'deny'] }),
+                      jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 's' }), 'snooze'] }),
+                      jsxs('span', { className: 'flex items-center gap-1', children: [jsx(Kbd, { children: 'o' }), 'open'] })
+                    ]
+                  })
+                : null
+            ]
+          })
+        ]
       }),
       jsx(ScrollArea, {
         className: 'min-h-0 flex-1',
@@ -1156,7 +1626,7 @@ function DayPage() {
                           : null,
                         jsx('div', {
                           className: 'flex flex-col gap-2.5',
-                          children: needs.map(item => jsx(NeedsYouCard, { item }, item.key))
+                          children: needs.map((item, i) => jsx(NeedsYouCard, { item, selected: i === sel }, item.key))
                         }),
                         hiddenCount
                           ? jsxs('div', {
@@ -1197,9 +1667,30 @@ function DayPage() {
                     })
                   : null,
                 empty
-                  ? jsx(EmptyState, {
-                      title: 'Nothing on the board',
-                      description: 'No approvals waiting, nothing running, nothing scheduled. Hermes is idle — start something and manage it from here.'
+                  ? jsxs('div', {
+                      className: 'flex flex-col items-center gap-3 py-16 text-center',
+                      children: [
+                        jsxs('svg', {
+                          width: 120,
+                          height: 64,
+                          viewBox: '0 0 120 64',
+                          'aria-hidden': true,
+                          children: [
+                            jsx('circle', { cx: 60, cy: 44, r: 14, fill: '#f59e0b', fillOpacity: 0.9 }),
+                            jsx('line', { x1: 60, y1: 14, x2: 60, y2: 24, stroke: '#f59e0b', strokeWidth: 2, strokeLinecap: 'round' }),
+                            jsx('line', { x1: 36, y1: 26, x2: 43, y2: 33, stroke: '#f59e0b', strokeWidth: 2, strokeLinecap: 'round' }),
+                            jsx('line', { x1: 84, y1: 26, x2: 77, y2: 33, stroke: '#f59e0b', strokeWidth: 2, strokeLinecap: 'round' }),
+                            jsx('line', { x1: 20, y1: 44, x2: 32, y2: 44, stroke: '#f59e0b', strokeWidth: 2, strokeLinecap: 'round' }),
+                            jsx('line', { x1: 88, y1: 44, x2: 100, y2: 44, stroke: '#f59e0b', strokeWidth: 2, strokeLinecap: 'round' }),
+                            jsx('line', { x1: 8, y1: 56, x2: 112, y2: 56, stroke: 'var(--ui-stroke-secondary)', strokeWidth: 2, strokeLinecap: 'round' })
+                          ]
+                        }),
+                        jsx('div', { className: 'text-[0.85rem] font-medium text-(--ui-text-primary)', children: 'Nothing on the board' }),
+                        jsx('div', {
+                          className: 'max-w-sm text-[0.75rem] leading-5 text-muted-foreground',
+                          children: 'No approvals waiting, nothing running, nothing scheduled. Hermes is idle — start something up top and run the whole day from here.'
+                        })
+                      ]
                     })
                   : null
               ]
@@ -1207,6 +1698,14 @@ function DayPage() {
             jsxs('aside', {
               className: 'flex min-w-0 flex-col gap-6 xl:border-l xl:border-(--ui-stroke-secondary) xl:pl-8',
               children: [
+                watching.length
+                  ? jsxs('section', {
+                      children: [
+                        jsx(SectionLabel, { icon: 'pinned', title: 'Watching', count: watching.length }),
+                        jsx('div', { className: 'flex flex-col', children: watching.map(w => jsx(WatchingRow, { entry: w }, w.storedId)) })
+                      ]
+                    })
+                  : null,
                 jsxs('section', {
                   children: [
                     jsx(SectionLabel, { icon: 'calendar', title: 'Scheduled', count: jobs.length }),
@@ -1302,6 +1801,7 @@ export default {
     $finished.set(loadFinished())
     $muted.set(loadMap(MUTED_KEY))
     $snoozed.set(loadMap(SNOOZE_KEY))
+    $pinned.set(loadMap(PINNED_KEY))
     $prefs.set({ notify: true, ...loadMap(PREFS_KEY) })
 
     ctx.onEvent('message.complete', ev => recordFinished(ev, 'done'))
@@ -1353,6 +1853,17 @@ export default {
           category: 'navigation',
           defaults: ['mod+shift+i'],
           run: () => host.navigate(DAY_PATH)
+        }
+      },
+      {
+        id: 'palette.notify',
+        area: PALETTE_AREA,
+        title: 'Day: Toggle notifications',
+        data: {
+          id: 'hermes-day.notify',
+          label: 'Day: Toggle notifications',
+          keywords: ['day', 'notify', 'quiet', 'alerts'],
+          run: () => setNotifyPref(!$prefs.get().notify)
         }
       }
     ])

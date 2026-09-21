@@ -14,6 +14,26 @@ Hermes Day is a full-screen desktop plugin for [Hermes Agent](https://github.com
 | **Finished — review** | Turns that completed (or errored) while you weren't looking — persist until you review or dismiss them. |
 | **Scheduled** | Every cron job across sources: next run, overdue and last-failure badges. |
 | **Sources** | Health of every profile/connection the inbox is scanning — with a per-source mute bell for the noisy ones. |
+| **Watching** | Pin any session to keep it on the rail — running or finished — until you unpin it. |
+
+The header carries a live **day arc** (a sun tracking 6 am–6 pm), a stats strip
+(waiting / in flight / to review), and the next scheduled job's countdown.
+
+## Keyboard triage
+
+When anything needs you, the board is fully keyboard-driven — the selected card
+shows its own key legend:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` or `↓` / `↑` | Move selection |
+| `a` | Allow once (approvals) |
+| `d` | Deny (approvals) |
+| `s` | Snooze 15 min |
+| `o` / `Enter` | Open the session |
+
+Clearing the last need triggers a small celebration — inbox zero should feel good.
+A filter field above the board narrows every queue by title, preview, or method.
 
 ## Stay in flow
 
@@ -21,19 +41,23 @@ Hermes Day is a full-screen desktop plugin for [Hermes Agent](https://github.com
 - **Desktop notifications** — new needs announce themselves via the OS (bell toggle in the header; the first scan never fires — no notification storm on launch).
 - **Snooze & mute** — snooze a card for 15 minutes, or mute a whole source; hidden items stay out of the counts until they're due.
 - **Flood bar** — when one session stacks up multiple approvals, a single "Allow all" bar clears them in one click via `approval.respond { all: true }`.
+- **Snooze presets** — 15 min, 1 hour, or tomorrow 9 am from the card's clock menu.
+- **Pin to Watching** — keep an eye on any session; pinned rows live in the rail until you release them.
 
 ## Act without opening the session
 
 - **Approvals** — Allow once / Allow session / Always / Deny inline, honoring the backend's choice set (`allow_permanent`, `smart_denied`, custom `choices`).
 - **Clarifies** — Choice buttons, free-text answers, and multi-question batches answered per-question via `clarify.lock`.
 - **Privileged prompts** (`sudo`, `secret`, `vault`, `mcp_setup`) — jump straight to the owning session; secrets stay typed into the session's masked input.
+- **Reply to a session** — running, waiting, and finished rows take an inline follow-up prompt (`prompt.submit`) — no need to open the session to steer it.
+- **Stop a runaway** — in-flight rows carry a stop button wired to `session.interrupt`.
 - Every row deep-links into its session through the owning connection/profile route (`host.openSession` with a stored `route` descriptor).
 
 ## Chrome it adds
 
 - **Full-screen `/day` page** — sidebar nav entry ("Day") plus a `ROUTES_AREA` route.
 - **Statusbar chip** — live count of items waiting on you; click to open Day.
-- **Command palette** — "Open Day" (`id: hermes-day.open`).
+- **Command palette** — "Open Day" (`hermes-day.open`) and "Day: Toggle notifications" (`hermes-day.notify`).
 - **Keybind** — `Mod+Shift+I` (rebindable in Settings → Keyboard).
 
 ## How it works
