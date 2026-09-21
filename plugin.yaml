@@ -27,4 +27,4 @@ provides_middleware: []
 requires_env: []
 config_schema:
   gate:
-    type: object
+    type: dict
