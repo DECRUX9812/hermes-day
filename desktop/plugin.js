@@ -96,6 +96,9 @@ const KIND_RANK = { approval: 0, clarify: 1, input: 2, other: 3 }
 const firstSeen = new Map()
 /** runtime session id -> { storedId, title, route } from the last scan */
 const lastLive = new Map()
+/** source.key -> recent stored session rows ({id, title, started_at}) for
+ *  bridging finished entries whose runtime id never got a session_key. */
+const $recentStored = atom({})
 /** ctx.storage / ctx.os, captured in register() for module-level use */
 let storageRef = null
 let notifyRef = null
@@ -330,10 +333,17 @@ async function scanRoute(route) {
     if (sessions && typeof sessions === 'object') {
       const ev = { ...$evidence.get() }
       for (const [k, v] of Object.entries(sessions)) {
-        if (v && v.verdict) ev[`${source.key}#${k}`] = v
+        if (v && (v.verdict || v.runs || v.blocks || (v.snaps && v.snaps.length))) ev[`${source.key}#${k}`] = v
       }
       $evidence.set(ev)
     }
+  } catch {}
+
+  // recent stored rows — bridges finished entries that never hit active_list
+  try {
+    const list = await rpc(route, 'session.list', { limit: 40 })
+    const rows = Array.isArray(list && list.sessions) ? list.sessions : []
+    $recentStored.set({ ...$recentStored.get(), [source.key]: rows })
   } catch {}
 
   // forget request ids that resolved between scans so re-asks re-stamp
@@ -526,6 +536,30 @@ const undoDismiss = () => {
   const next = [u.f, ...$finished.get().filter(f => f.key !== u.f.key)]
   $finished.set(next)
   persistFinished(next)
+}
+
+/** Best-effort runtime→stored-id bridge for sessions that finished between
+ *  scans (never seen in active_list, so lastLive missed them). `session.list`
+ *  row `id` IS the stored session_key; match on title when known, else the
+ *  single closest `started_at` inside a 90s window. */
+function resolveStoredId(f) {
+  if (!f) return null
+  if (f.storedId) return f.storedId
+  const stored = $recentStored.get()
+  const sourceKey = f.sourceKey || (f.route ? routeKey(f.route) : 'local')
+  const rows = stored[sourceKey] || Object.values(stored).flat()
+  if (!rows.length) return null
+  let best = null
+  let bestDt = Infinity
+  for (const r of rows) {
+    if (!r || !r.id) continue
+    if (f.title && f.title !== 'Session' && r.title && r.title !== f.title) continue
+    const started = epochMs(r.started_at)
+    if (!started || started > f.at + 5000) continue
+    const dt = f.at - started
+    if (dt < bestDt) { bestDt = dt; best = r }
+  }
+  return best && bestDt < 90000 ? best.id : null
 }
 
 function recordFinished(ev, kind) {
@@ -1300,9 +1334,13 @@ function EvidenceBadge({ ev }) {
 }
 
 function evidenceFor(f, map) {
-  if (!f.storedId) return null
-  const scoped = `${f.route ? routeKey(f.route) : 'local'}#${f.storedId}`
-  return map[scoped] || map[f.storedId] || null
+  const sid = resolveStoredId(f)
+  if (!sid) return null
+  const scoped = `${f.route ? routeKey(f.route) : 'local'}#${sid}`
+  if (map[scoped] || map[sid]) return map[scoped] || map[sid]
+  const suf = `#${sid}`
+  const k = Object.keys(map).find(key => key.endsWith(suf))
+  return k ? map[k] : null
 }
 
 function FinishedRow({ f }) {
@@ -1850,6 +1888,214 @@ async function fetchEventsFor(e) {
 }
 
 const evType = e => String(e.type || e.event || '')
+const evSeq = e => (typeof e.seq === 'number' ? e.seq : -1)
+
+// turn boundaries from the replay stream: message.start opens, message.complete seals
+function turnsFromEvents(events) {
+  const turns = []
+  let open = null
+  const labelFor = evs => {
+    let blocked = false, edited = null, check = null, tools = 0
+    for (const e of evs) {
+      const t = evType(e)
+      if (t === 'tool.start' || t === 'tool.complete') {
+        tools++
+        const res = String(e.result_text || e.summary || '')
+        if (/honesty guard BLOCKED/i.test(res)) blocked = true
+        if (t === 'tool.complete' && e.inline_diff) {
+          edited = (e.args && (e.args.path || e.args.file_path)) || edited
+          if (!edited) edited = e.name || 'file'
+        }
+        if (t === 'tool.complete' && (e.name === 'terminal' || e.name === 'bash')) {
+          const c = (e.args && (e.args.command || e.args.code)) || ''
+          if (/\b(pytest|jest|vitest|go test|cargo test|npm (run )?test|unittest|ruff|mypy|tsc|eslint)\b/.test(c))
+            check = e
+        }
+      }
+    }
+    if (blocked) return '⚠ guard'
+    if (edited) return `edit ${String(edited).split('/').pop()}`
+    if (check) return 'tests'
+    if (tools) return `${tools} tool${tools > 1 ? 's' : ''}`
+    return 'reply'
+  }
+  for (const e of events) {
+    const t = evType(e)
+    if (t === 'message.start') open = { startSeq: evSeq(e), evs: [] }
+    if (open) open.evs.push(e)
+    if (t === 'message.complete' && open) {
+      turns.push({ n: turns.length + 1, startSeq: open.startSeq, endSeq: evSeq(e), ts: e.ts || 0,
+                   status: e.status || 'complete', label: labelFor(open.evs) })
+      open = null
+    }
+  }
+  if (open) turns.push({ n: turns.length + 1, startSeq: open.startSeq, endSeq: MAX_SEQ,
+                         ts: Date.now() / 1000, status: 'live', label: `${labelFor(open.evs)}…` })
+  return turns
+}
+
+function TurnScrubber({ turns, scrub, onScrub, onRevert, reverting, revertNote, snaps }) {
+  if (!turns.length) return null
+  // replay frames carry seq but no ts — snaps are numbered in turn order, so
+  // turn N maps to the latest snap numbered ≤ N (approximate across multi-snap turns)
+  const snapForTurn = t => {
+    let best = null
+    for (const s of snaps || []) if ((s.n || 0) <= t.n) best = s
+    return best
+  }
+  return jsxs('div', {
+    className: 'flex shrink-0 items-center gap-1 overflow-x-auto px-3 pb-2 pt-1',
+    children: [
+      jsxs('span', { className: 'mr-1 shrink-0 text-[0.6rem] uppercase tracking-wider', style: { color: C.faint }, children: ['turns'] }),
+      turns.map(t => {
+        const active = scrub === t.endSeq || (scrub === null && t.endSeq === MAX_SEQ)
+        const bad = t.label.includes('⚠')
+        return jsx('button', {
+          className: 'hday-chip shrink-0 rounded border px-1.5 py-0.5 font-mono text-[0.6rem]',
+          style: {
+            borderColor: active ? C.mono : C.border,
+            color: bad ? C.red : active ? C.text : C.muted,
+            background: active ? '#1a1d26' : 'transparent'
+          },
+          onClick: () => { onScrub(t.endSeq === MAX_SEQ ? null : t.endSeq); haptic('selection') },
+          children: `T${t.n} ${t.label}`
+        }, t.n)
+      }),
+      scrub !== null
+        ? jsx('button', {
+            className: 'hday-chip shrink-0 rounded border px-1.5 py-0.5 font-mono text-[0.6rem]',
+            style: { borderColor: C.border, color: C.muted },
+            onClick: () => { onScrub(null); haptic('selection') },
+            children: '⟶ latest'
+          })
+        : null,
+      (() => {
+        if (scrub === null) return null
+        const t = turns.find(x => x.endSeq === scrub)
+        const snap = t && snapForTurn(t)
+        return snap
+          ? jsx(Button, {
+              size: 'xs', variant: 'secondary', className: 'ml-auto h-5 shrink-0 text-[0.62rem]',
+              disabled: Boolean(reverting),
+              onClick: () => onRevert(snap),
+              children: reverting ? spinIcon('sync') : `⚡ revert to T${snap.n}`
+            })
+          : null
+      })(),
+      revertNote ? jsx('span', { className: 'ml-auto shrink-0 text-[0.62rem]', style: { color: revertNote.startsWith('!') ? C.red : C.emerald }, children: revertNote.replace(/^!/, '') }) : null
+    ]
+  })
+}
+
+function ImpactView({ data, loading }) {
+  if (loading) return jsxs('div', { className: 'flex items-center gap-2 px-3 py-6', style: { color: C.faint }, children: [jsx(Loader, {}), jsx('span', { className: 'text-[0.72rem]', children: 'Scanning blast radius…' })] })
+  const roots = (data && data.roots) || []
+  if (!roots.length) return jsx('div', { className: 'px-3 py-6 text-[0.72rem]', style: { color: C.faint }, children: 'No repo-backed file changes recorded for this session.' })
+  return jsx('div', {
+    className: 'flex flex-col gap-3 p-3',
+    children: roots.map((r, i) => jsxs('div', {
+      className: 'flex flex-col gap-2',
+      children: [
+        jsx('div', { className: 'truncate font-mono text-[0.62rem]', style: { color: C.faint }, children: r.root }),
+        r.touched.length
+          ? jsxs('div', {
+              children: [
+                jsx('div', { className: 'mb-1 text-[0.62rem] font-semibold uppercase tracking-wider', style: { color: C.faint }, children: 'Touched symbols' }),
+                jsx('div', {
+                  className: 'flex flex-col gap-1',
+                  children: r.touched.map((t, j) => jsxs('div', {
+                    className: 'flex flex-col gap-0.5',
+                    children: [
+                      jsx('div', { className: 'truncate font-mono text-[0.66rem]', style: { color: C.mono }, children: t.path }),
+                      t.symbols.length
+                        ? jsx('div', {
+                            className: 'flex flex-wrap gap-1',
+                            children: t.symbols.map((s, k) => jsx('span', {
+                              className: 'rounded border px-1 py-px font-mono text-[0.6rem]',
+                              style: { borderColor: C.border, color: C.muted }, children: s
+                            }, k))
+                          })
+                        : jsx('div', { className: 'text-[0.62rem]', style: { color: C.faint }, children: '(no defs parsed)' })
+                    ]
+                  }, j))
+                })
+              ]
+            })
+          : jsx('div', { className: 'text-[0.68rem]', style: { color: C.faint }, children: 'No files recorded as touched.' }),
+        jsxs('div', {
+          children: [
+            jsx('div', { className: 'mb-1 text-[0.62rem] font-semibold uppercase tracking-wider', style: { color: C.faint }, children: `Downstream dependents (${r.dependents.length})` }),
+            r.dependents.length
+              ? jsx('div', {
+                  className: 'flex flex-col gap-0.5',
+                  children: r.dependents.map((d, j) => jsxs('div', {
+                    className: 'flex items-center gap-2 text-[0.68rem]',
+                    children: [
+                      jsx(Codicon, {
+                        name: d.is_test ? 'beaker' : d.covered ? 'pass-filled' : 'warning',
+                        className: 'shrink-0 text-[0.66rem]',
+                        style: { color: d.is_test ? C.muted : d.covered ? C.emerald : C.amber }
+                      }),
+                      jsx('span', { className: 'min-w-0 flex-1 truncate font-mono', style: { color: C.text }, children: d.path }),
+                      d.calls && d.calls.length
+                        ? jsx('span', { className: 'truncate text-[0.6rem]', style: { color: C.faint }, children: `uses ${d.calls.slice(0, 3).join(', ')}` })
+                        : null,
+                      !d.is_test && !d.covered
+                        ? jsx('span', { className: 'shrink-0 rounded px-1 py-px text-[0.58rem] font-semibold', style: { color: C.red, background: '#ef44441c' }, children: 'NO TEST COVER' })
+                        : null
+                    ]
+                  }, j))
+                })
+              : jsx('div', { className: 'text-[0.68rem]', style: { color: C.faint }, children: 'Nothing imports or references the touched files.' })
+          ]
+        })
+      ]
+    }, i))
+  })
+}
+
+function TrapCard({ b }) {
+  return jsxs('div', {
+    className: 'flex flex-col gap-1.5 rounded border px-2 py-2',
+    style: { borderColor: C.border, background: C.surface },
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-2',
+        children: [
+          jsx(Codicon, { name: 'shield', className: 'shrink-0 text-[0.7rem]', style: { color: C.red } }),
+          jsx('span', { className: 'rounded px-1 py-px text-[0.6rem] font-semibold', style: { color: C.amber, background: '#f59e0b1c' }, children: b.rule || 'Honesty Guard' }),
+          jsx('span', { className: 'ml-auto shrink-0 text-[0.6rem]', style: { color: C.faint }, children: b.ts ? relativeTime(b.ts * 1000) : '' })
+        ]
+      }),
+      b.call
+        ? jsx('pre', {
+            className: 'overflow-x-auto whitespace-pre-wrap break-all rounded px-2 py-1 font-mono text-[0.64rem]',
+            style: { background: '#0b0c10', color: C.mono, border: `1px solid ${C.border}` },
+            children: b.call
+          })
+        : null,
+      jsx('div', { className: 'text-[0.66rem]', style: { color: C.muted }, children: `${b.tool} — ${b.reason}` }),
+      b.intervention
+        ? jsxs('details', {
+            className: 'group',
+            children: [
+              jsxs('summary', {
+                className: 'flex cursor-pointer list-none items-center gap-1.5 text-[0.64rem]',
+                style: { color: C.faint },
+                children: [jsx(Codicon, { name: 'chevron-right', className: 'text-[0.62rem] transition-transform group-open:rotate-90' }), 'Intervention prompt sent back to the agent']
+              }),
+              jsx('pre', {
+                className: 'mt-1 whitespace-pre-wrap break-all rounded border px-2 py-1.5 font-mono text-[0.62rem]',
+                style: { borderColor: C.border, color: C.muted, background: '#0b0c10' },
+                children: b.intervention
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
 const jsonShort = v => {
   try {
     const s = typeof v === 'string' ? v : JSON.stringify(v)
@@ -1964,15 +2210,26 @@ function EvidenceView({ ev }) {
       ev.block_list && ev.block_list.length
         ? jsxs('div', {
             children: [
-              jsx('div', { className: 'mb-1 text-[0.62rem] font-semibold uppercase tracking-wider', style: { color: C.red }, children: 'Honesty guard blocks' }),
+              jsx('div', { className: 'mb-1 text-[0.62rem] font-semibold uppercase tracking-wider', style: { color: C.red }, children: `Trap ledger (${ev.block_list.length})` }),
+              jsx('div', {
+                className: 'flex flex-col gap-1.5',
+                children: ev.block_list.map((b, i) => jsx(TrapCard, { b }, i))
+              })
+            ]
+          })
+        : null,
+      ev.snaps && ev.snaps.length
+        ? jsxs('div', {
+            children: [
+              jsx('div', { className: 'mb-1 text-[0.62rem] font-semibold uppercase tracking-wider', style: { color: C.faint }, children: `Turn snapshots (${ev.snaps.length})` }),
               jsx('div', {
                 className: 'flex flex-col gap-0.5',
-                children: ev.block_list.map((b, i) => jsxs('div', {
-                  className: 'flex items-center gap-2 text-[0.66rem]',
+                children: ev.snaps.map((s, i) => jsxs('div', {
+                  className: 'flex items-center gap-2 font-mono text-[0.64rem]',
                   children: [
-                    jsx(Codicon, { name: 'shield', className: 'text-[0.66rem]', style: { color: C.red } }),
-                    jsx('span', { style: { color: C.muted }, children: `${b.tool} — ${b.reason}` }),
-                    jsx('span', { className: 'ml-auto shrink-0', style: { color: C.faint }, children: b.ts ? relativeTime(b.ts * 1000) : '' })
+                    jsx('span', { style: { color: C.mono }, children: `#${s.n}` }),
+                    jsx('span', { className: 'truncate', style: { color: C.muted }, children: s.label }),
+                    jsx('span', { className: 'ml-auto shrink-0', style: { color: C.faint }, children: (s.sha || '').slice(0, 8) })
                   ]
                 }, i))
               })
@@ -2032,7 +2289,7 @@ function SessInspectorBody({ e }) {
   const pinnedMap = useValue($pinned)
   const sess = e.type === 'finished' ? null : e.row.session
   const f = e.type === 'finished' ? e.f : null
-  const storedId = sess ? sess.session_key : f.storedId
+  const storedId = sess ? sess.session_key : resolveStoredId(f)
   const runtimeId = sess ? sess.id : f.runtimeId
   const route = sess ? e.row.route : f.route
   const title = sess ? sess.title : f.title
@@ -2149,14 +2406,91 @@ function SessInspectorBody({ e }) {
   })
 }
 
-const INSP_TABS = [['details', 'Details'], ['evidence', 'Evidence'], ['diff', 'Diff'], ['trace', 'Trace']]
+function GhostDock({ e, route, runtimeId, storedId }) {
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState('')
+  const [note, setNote] = useState('')
+  const isLive = Boolean(runtimeId) && e.type !== 'finished'
+
+  const steer = async () => {
+    const t = text.trim()
+    if (!t) return
+    setBusy('steer')
+    try {
+      const res = await rpc(route, 'session.steer', { session_id: runtimeId, text: t })
+      setNote(res && res.status === 'rejected' ? 'steer rejected — session may be mid-build' : `steered — ${res && res.status || 'ok'}`)
+      if (res && res.status !== 'rejected') setText('')
+      haptic('submit')
+    } catch (err) {
+      setNote(`steer failed: ${errMsg(err)}`)
+      haptic('cancel')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const branch = async () => {
+    setBusy('branch')
+    try {
+      const res = await rpc(route, 'session.resume', { session_id: storedId, omit_messages: true })
+      const liveSid = res && res.session_id
+      const br = await rpc(route, 'session.branch', { session_id: liveSid || storedId })
+      if (br && br.stored_session_id) {
+        setNote(`branched — ${br.title || br.stored_session_id}`)
+        host.openSession(br.stored_session_id, {}).catch(() => {})
+        haptic('submit')
+      } else setNote('branch failed')
+    } catch (err) {
+      setNote(`branch failed: ${errMsg(err)}`)
+      haptic('cancel')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  if (!isLive && !storedId) return null
+  return jsxs('div', {
+    className: 'flex shrink-0 items-center gap-1.5 px-3 py-2',
+    style: { borderTop: `1px solid ${C.border}`, background: C.surface },
+    children: [
+      jsx(Codicon, { name: 'comment-discussion', className: 'shrink-0 text-[0.72rem]', style: { color: C.mono } }),
+      isLive
+        ? jsxs('div', {
+            className: 'flex min-w-0 flex-1 items-center gap-1.5',
+            children: [
+              jsx(Input, {
+                value: text,
+                placeholder: 'Ghost-steer — injected mid-run, no restart…',
+                onChange: ev => setText(ev.target.value),
+                onKeyDown: ev => {
+                  ev.stopPropagation()
+                  if (isSubmitEnter(ev)) steer()
+                },
+                className: 'h-7 flex-1 text-[0.76rem]'
+              }),
+              jsx(Button, { size: 'xs', variant: 'secondary', disabled: !text.trim() || Boolean(busy), onClick: steer, children: busy === 'steer' ? spinIcon('sync') : 'Steer' })
+            ]
+          })
+        : jsx(Button, {
+            size: 'xs', variant: 'secondary', disabled: Boolean(busy), onClick: branch,
+            children: busy === 'branch' ? spinIcon('sync') : '⑂ Branch from here'
+          }),
+      note ? jsx('span', { className: 'shrink-0 text-[0.62rem]', style: { color: note.includes('fail') || note.includes('reject') ? C.red : C.emerald }, children: note }) : null
+    ]
+  })
+}
+
+const INSP_TABS = [['details', 'Details'], ['evidence', 'Evidence'], ['impact', 'Impact'], ['diff', 'Diff'], ['trace', 'Trace']]
 
 function Inspector({ e, evMap }) {
   const [tab, setTab] = useState('details')
+  const [scrub, setScrub] = useState(null)
+  const [reverting, setReverting] = useState(false)
+  const [revertNote, setRevertNote] = useState('')
   const selKey = e ? e.key : ''
-  const isSessionish = e && e.type !== 'need'
   const runtimeId = !e ? null : e.type === 'finished' ? e.f.runtimeId : e.type === 'need' ? e.item.sessionId : e.row.session.id
   const route = !e ? null : e.type === 'finished' ? e.f.route : e.type === 'need' ? e.item.route : e.row.route
+  const storedId = !e ? null : e.type === 'finished' ? resolveStoredId(e.f) : e.type === 'need' ? e.item.storedId : e.row.session.session_key
   const eventsQ = useQuery({
     queryKey: [...INSP_QK, selKey],
     queryFn: () => fetchEventsFor(e),
@@ -2164,10 +2498,22 @@ function Inspector({ e, evMap }) {
     refetchInterval: 3000,
     staleTime: 1200
   })
+  const impactQ = useQuery({
+    queryKey: ['hday-impact', selKey],
+    queryFn: async () => {
+      const disp = await rpc(route, 'command.dispatch', { name: 'day-impact', arg: storedId || '' })
+      const out = disp && (disp.output || disp.text || '')
+      return out && out.trim().startsWith('{') ? JSON.parse(out) : { ok: false, error: 'no response' }
+    },
+    enabled: Boolean(e && storedId),
+    staleTime: 15000
+  })
   const ev = e ? feedEvidence(e, evMap) : null
 
   useEffect(() => {
     setTab('details')
+    setScrub(null)
+    setRevertNote('')
   }, [selKey])
 
   if (!e) {
@@ -2187,8 +2533,26 @@ function Inspector({ e, evMap }) {
 
   const title = feedTitle(e)
   const st = FEED_ICON[e.type](e)
-  const events = (eventsQ.data && eventsQ.data.events) || []
+  const allEvents = (eventsQ.data && eventsQ.data.events) || []
+  const turns = turnsFromEvents(allEvents)
+  const events = scrub === null ? allEvents : allEvents.filter(x => evSeq(x) <= scrub)
   const tabs = INSP_TABS.filter(([k]) => k !== 'evidence' || Boolean(ev))
+
+  const revertTo = async snap => {
+    setReverting(true)
+    try {
+      const disp = await rpc(route, 'command.dispatch', { name: 'day-rollback', arg: `${storedId || ''} ${snap.sha}` })
+      const out = disp && (disp.output || disp.text || '')
+      const res = out && out.trim().startsWith('{') ? JSON.parse(out) : null
+      setRevertNote(res && res.ok ? `reverted to snap ${snap.n}` : `!${(res && res.error) || 'rollback failed'}`)
+      haptic(res && res.ok ? 'submit' : 'cancel')
+    } catch (err) {
+      setRevertNote(`!${errMsg(err)}`)
+      haptic('cancel')
+    } finally {
+      setReverting(false)
+    }
+  }
 
   return jsxs('div', {
     className: 'flex h-full min-h-0 flex-col',
@@ -2212,6 +2576,10 @@ function Inspector({ e, evMap }) {
           })
         ]
       }),
+      jsx(TurnScrubber, {
+        turns, scrub, snaps: ev && ev.snaps, reverting, revertNote,
+        onScrub: setScrub, onRevert: revertTo
+      }),
       jsxs('div', {
         className: 'flex shrink-0 items-center gap-3 px-3 pt-1',
         children: tabs.map(([k, label]) => jsx('button', {
@@ -2229,13 +2597,16 @@ function Inspector({ e, evMap }) {
             : jsx(SessInspectorBody, { e })
           : tab === 'evidence'
             ? jsx(EvidenceView, { ev })
-            : tab === 'diff'
-              ? jsx(DiffView, { events })
-              : jsx(TraceView, { events })
+            : tab === 'impact'
+              ? jsx(ImpactView, { data: impactQ.data, loading: impactQ.isLoading })
+              : tab === 'diff'
+                ? jsx(DiffView, { events })
+                : jsx(TraceView, { events })
       }),
       eventsQ.data && eventsQ.data.truncated
         ? jsx('div', { className: 'shrink-0 px-3 py-1 text-[0.62rem]', style: { color: C.faint, borderTop: `1px solid ${C.border}` }, children: 'replay window truncated — open the session for the full history' })
-        : null
+        : null,
+      jsx(GhostDock, { e, route, runtimeId, storedId })
     ]
   })
 }

@@ -13,8 +13,16 @@ Companion to the desktop cockpit (``desktop/plugin.js``). Registers:
   ``{"action": "continue"}`` nudges while evidence is missing (self-throttled
   to two nudges, inside the framework's ``agent.max_verify_nudges`` bound).
 - ``on_session_finalize`` — settles the session's verdict on teardown.
-- ``/day-evidence`` — plugin command returning the JSON verdict map the
-  desktop half polls via ``command.dispatch`` for its Evidence badges.
+- Turn snapshots — after each file-mutating tool call, commits the
+  workspace to a private git ref (``refs/hday/tsnap/<sid>/<n>``) via
+  commit-tree plumbing on a throwaway index; the worktree and the user's
+  real index are never touched. Powers the inspector's turn scrubber.
+- ``/day-evidence`` — JSON verdict map (verdicts, runs, trap ledger,
+  snapshots) the desktop half polls via ``command.dispatch``.
+- ``/day-rollback`` — ``<session_key> <sha>``: restores the worktree to a
+  turn snapshot (``git restore --source``).
+- ``/day-impact`` — ``<session_key>``: blast-radius scan — symbols touched,
+  downstream dependents, and which dependents lack test coverage.
 
 State: per-session records in ``ctx.state`` under the ``sessions`` key
 (capped, trimmed), plus an in-memory mirror for hot-path updates.
@@ -25,6 +33,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import tempfile
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -33,6 +43,7 @@ _STATE_KEY = "sessions"
 _MAX_SESSIONS = 60
 _MAX_RUNS = 20
 _MAX_BLOCKS = 20
+_MAX_SNAPS = 25
 _MAX_VERIFY_NUDGES = 2  # self-throttle; framework caps at agent.max_verify_nudges
 
 _CTX = None  # PluginContext, set in register()
@@ -68,27 +79,33 @@ _COMMAND_VIOLATIONS = (
     (
         re.compile(r"\b(?:rm|rmdir|unlink|del(?:ete)?|trash(?:-put)?|shred)\b[^;&|\n]*" + _TEST_TOKEN, re.I),
         "deletes test files",
+        "Test Deletion",
     ),
     (
         re.compile(r"\bgit\s+(?:rm|clean|restore|checkout|reset)\b[^;&|\n]*" + _TEST_TOKEN, re.I),
         "reverts or removes test files via git",
+        "Test Reversion",
     ),
     (
         re.compile(r"\b(?:sed\s+-i|perl\s+-pi?|ed\s|awk\b[^;&|\n]*>\s*)\b[^;&|\n]*" + _TEST_TOKEN, re.I),
         "rewrites a test file in place",
+        "In-Place Test Rewrite",
     ),
     (
         re.compile(r"(?:^|[;&|]\s*|>\s*|>>\s*)[>]{1,2}\s*['\"]?" + _TEST_TOKEN),
         "truncates a test file",
+        "Test Truncation",
     ),
     (
         re.compile(r"--pass[-_]?with[-_]?no[-_]?tests|--allow[-_]?empty(?:-results)?|"
                    r"--ignore[-_]?failures|--force(?:exit)?(?:\s|=|[^\w-])", re.I),
         "adds a force-pass / empty-suite flag",
+        "Exit Code Laundering",
     ),
     (
         re.compile(_CHECK_WORD + r"[^\n]*?(?:\|\|\s*(?:true|:|echo\b)|[;&|]\s*exit\s+0\b)", re.I),
         "launders the check's exit status",
+        "Exit Code Laundering",
     ),
 )
 
@@ -111,7 +128,7 @@ _PATH_KEYS = ("path", "file_path", "target_file", "filePath", "notebook_path")
 
 def _new_rec() -> Dict[str, Any]:
     return {"files": [], "runs": [], "blocks": [], "verdict": None,
-            "detail": "", "at": 0.0, "nudges": 0}
+            "detail": "", "at": 0.0, "nudges": 0, "snaps": []}
 
 
 def _rec(sid: str) -> Dict[str, Any]:
@@ -161,10 +178,11 @@ def _load_persisted() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _command_violation(cmd: str) -> Optional[str]:
-    for pattern, reason in _COMMAND_VIOLATIONS:
+def _command_violation(cmd: str) -> Optional[tuple]:
+    """(reason, rule) for a shell command that fakes a pass, else None."""
+    for pattern, reason, rule in _COMMAND_VIOLATIONS:
         if pattern.search(cmd):
-            return reason
+            return reason, rule
     return None
 
 
@@ -218,26 +236,37 @@ def _edit_violation(path: str, args: Dict[str, Any]) -> Optional[str]:
             continue  # creating/extending a test file is fine
         a_old, a_new = _assertion_lines(old, path), _assertion_lines(new, path)
         if a_old > 0 and a_new == 0:
-            return f"deletes all {a_old} assertion(s) in {path}"
+            return f"deletes all {a_old} assertion(s) in {path}", "Assertion Gutting"
         if a_old >= 2 and a_new < a_old:
-            return f"weakens assertions in {path} ({a_old} -> {a_new})"
+            return f"weakens assertions in {path} ({a_old} -> {a_new})", "Assertion Gutting"
     return None
 
 
-def _block(sid: str, tool_name: str, reason: str) -> Dict[str, str]:
-    with _LOCK:
-        rec = _rec(sid)
-        _append(rec["blocks"], {"reason": reason, "tool": tool_name, "ts": time.time()},
-                _MAX_BLOCKS)
-        rec["verdict"] = "flagged"
-        rec["detail"] = f"honesty guard x{len(rec['blocks'])}"
-        rec["at"] = time.time()
-        _persist()
+def _call_preview(tool_name: str, args: Dict[str, Any]) -> str:
+    """Short monospace-friendly rendering of the attempted tool call."""
+    if tool_name == "terminal":
+        return str(args.get("command") or args.get("code") or "")[:300]
+    path = next((str(args.get(k) or "") for k in _PATH_KEYS if args.get(k)), "")
+    return f"{tool_name} {path}"[:300]
+
+
+def _block(sid: str, tool_name: str, reason: str, rule: str = "Honesty Guard",
+           args: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     message = (
         f"Hermes Day honesty guard BLOCKED this call — it {reason}. Tests and checks are "
         "evidence, not decoration: fix the implementation or ask the human, do not modify, "
         "delete, or launder the test suite to force a pass."
     )
+    with _LOCK:
+        rec = _rec(sid)
+        _append(rec["blocks"], {"reason": reason, "rule": rule, "tool": tool_name,
+                                "call": _call_preview(tool_name, args or {}),
+                                "intervention": message, "ts": time.time()},
+                _MAX_BLOCKS)
+        rec["verdict"] = "flagged"
+        rec["detail"] = f"honesty guard x{len(rec['blocks'])}"
+        rec["at"] = time.time()
+        _persist()
     return {"action": "block", "message": message}
 
 
@@ -247,15 +276,17 @@ def _pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         if not _enabled("honesty"):
             return None
         args = args if isinstance(args, dict) else {}
+        hit = None
         if tool_name == "terminal":
             cmd = str(args.get("command") or args.get("code") or "")
-            reason = _command_violation(cmd) if cmd else None
+            hit = _command_violation(cmd) if cmd else None
         elif tool_name in _FILE_EDIT_TOOLS:
             path = next((str(args.get(k) or "") for k in _PATH_KEYS if args.get(k)), "")
-            reason = _edit_violation(path, args)
-        else:
+            hit = _edit_violation(path, args)
+        if not hit:
             return None
-        return _block(session_id, tool_name, reason) if reason else None
+        reason, rule = hit
+        return _block(session_id, tool_name, reason, rule, args)
     except Exception:
         return None  # never let the guard wedge the tool loop
 
@@ -296,6 +327,12 @@ def _post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         if not _enabled("observe"):
             return
         args = args if isinstance(args, dict) else {}
+        if isinstance(result, str) and "honesty guard BLOCKED" in result:
+            return  # vetoed calls echo back as tool results — not evidence
+        if status == "error":
+            failed_edit = tool_name in _FILE_EDIT_TOOLS
+        else:
+            failed_edit = False
         with _LOCK:
             rec = _rec(session_id)
             if tool_name in _FILE_EDIT_TOOLS:
@@ -303,20 +340,103 @@ def _post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
                 if path and path not in rec["files"]:
                     rec["files"].append(path)
                     del rec["files"][: max(0, len(rec["files"]) - 40)]
+                if not failed_edit and _enabled("snaps"):
+                    _snapshot(rec, session_id, path, f"{tool_name} {os.path.basename(path)}")
+                    _persist()
                 return
             if tool_name != "terminal":
                 return
             cmd = str(args.get("command") or args.get("code") or "")
+            if cmd and _WRITE_CMD_RE.search(cmd) and _enabled("snaps"):
+                _snapshot(rec, session_id, "", f"$ {cmd[:50]}")
             if not cmd or not _CHECK_RE.search(cmd):
                 return
-            if isinstance(result, str) and "honesty guard BLOCKED" in result:
-                return  # vetoed calls echo back as tool results — not evidence
             code = _exit_code(result, status)
             _append(rec["runs"], {"cmd": cmd[:240], "exit": code,
                                   "ok": code == 0, "ts": time.time()}, _MAX_RUNS)
             _persist()
     except Exception:
         return
+
+
+# ---------------------------------------------------------------------------
+# Turn snapshots — shadow-git plumbing on a throwaway index
+# ---------------------------------------------------------------------------
+
+# terminal commands that plausibly mutate the workspace (snapshot after them)
+_WRITE_CMD_RE = re.compile(
+    r"(?:>>?[^&|]|sed\s+-i|\btee\b|\b(?:mv|cp|rm|mkdir|touch|truncate|dd)\b|"
+    r"\b(?:npm|pnpm|yarn|pip|uv|poetry|cargo|go)\s+(?:install|add|update|remove)|"
+    r"\bmake\b|\bapply_patch\b|\bchown|\bchmod)",
+    re.I,
+)
+
+
+def _git(root: str, *args: str, env: Optional[Dict[str, str]] = None,
+         timeout: int = 15) -> subprocess.CompletedProcess:
+    full_env = dict(os.environ)
+    full_env["GIT_OPTIONAL_LOCKS"] = "0"
+    if env:
+        full_env.update(env)
+    return subprocess.run(
+        ["git", "-C", root, *args], capture_output=True, text=True,
+        env=full_env, timeout=timeout)
+
+
+def _repo_root(path: str) -> Optional[str]:
+    """Git toplevel containing ``path``, or None when it isn't in a repo."""
+    if not path or not os.path.isabs(path):
+        return None
+    start = path if os.path.isdir(path) else os.path.dirname(path)
+    if not start or not os.path.isdir(start):
+        return None
+    try:
+        out = _git(start, "rev-parse", "--show-toplevel", timeout=5)
+    except Exception:
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def _snapshot(rec: Dict[str, Any], sid: str, hint_path: str, label: str) -> None:
+    """Commit the worktree (incl. untracked) to a private ref via a temp index.
+
+    Never touches the user's real index or the working tree:
+    GIT_INDEX_FILE points at a scratch file, commit-tree writes an object.
+    Caller holds _LOCK.
+    """
+    root = _repo_root(hint_path or "") or rec.get("_root")
+    if not root:
+        return
+    rec["_root"] = root  # remember the workspace root for later snaps/impact
+    try:
+        head_tree = _git(root, "rev-parse", "HEAD^{tree}", timeout=5)
+        fd, idx = tempfile.mkstemp(prefix="hday-idx-", dir=os.path.join(root, ".git"))
+        os.close(fd)
+        try:
+            env = {"GIT_INDEX_FILE": idx}
+            _git(root, "read-tree", "HEAD", env=env)
+            _git(root, "add", "-A", env=env, timeout=30)
+            tree = _git(root, "write-tree", env=env).stdout.strip()
+        finally:
+            try:
+                os.unlink(idx)
+            except OSError:
+                pass
+        if not tree or (head_tree.returncode == 0 and tree == head_tree.stdout.strip()):
+            return  # nothing changed vs HEAD — no snap needed
+        snaps = rec["snaps"]
+        if snaps and snaps[-1].get("tree") == tree:
+            return  # identical to the previous snap
+        n = len(snaps) + 1
+        msg = f"[hday-turnsnap] {sid} turn-snapshot {n}: {label[:60]}"
+        sha = _git(root, "commit-tree", tree, "-p", "HEAD", "-m", msg).stdout.strip()
+        if not sha:
+            return
+        _git(root, "update-ref", f"refs/hday/tsnap/{sid}/{n}", sha)
+        _append(snaps, {"n": n, "sha": sha, "tree": tree, "root": root,
+                        "label": label[:80], "ts": time.time()}, _MAX_SNAPS)
+    except Exception:
+        return  # snapshots are best-effort — never wedge the tool loop
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +539,13 @@ def _public_rec(rec: Dict[str, Any]) -> Dict[str, Any]:
         "nudges": rec.get("nudges") or 0,
         "run_list": [{"cmd": r.get("cmd"), "exit": r.get("exit"), "ok": r.get("ok"),
                       "ts": r.get("ts")} for r in (rec.get("runs") or [])[-8:]],
-        "block_list": [{"reason": b.get("reason"), "tool": b.get("tool"),
-                        "ts": b.get("ts")} for b in (rec.get("blocks") or [])[-8:]],
+        "block_list": [{"reason": b.get("reason"), "rule": b.get("rule"),
+                        "tool": b.get("tool"), "call": b.get("call") or "",
+                        "intervention": b.get("intervention") or "",
+                        "ts": b.get("ts")} for b in (rec.get("blocks") or [])[-10:]],
+        "snaps": [{"n": s.get("n"), "sha": s.get("sha"), "label": s.get("label"),
+                   "root": s.get("root"), "ts": s.get("ts")}
+                  for s in (rec.get("snaps") or [])],
     }
 
 
@@ -432,6 +557,189 @@ def _cmd_evidence(arg: str = "") -> str:
     if sid:
         return json.dumps({"ok": True, "sessions": {sid: sessions.get(sid)}})
     return json.dumps({"ok": True, "sessions": sessions})
+
+
+def _find_rec(sid: str) -> Optional[Dict[str, Any]]:
+    """Look a session record up by exact id or by stored-key suffix match."""
+    with _LOCK:
+        if sid in _SESSIONS:
+            return _SESSIONS[sid]
+        for k, rec in _SESSIONS.items():
+            if sid and (k == sid or k.endswith(sid) or sid in k):
+                return rec
+    return None
+
+
+def _cmd_rollback(arg: str = "") -> str:
+    """``<session_key> <sha>`` — restore the worktree to a turn snapshot."""
+    parts = (arg or "").split()
+    if len(parts) < 2:
+        return json.dumps({"ok": False, "error": "usage: day-rollback <session_key> <sha>"})
+    sid, sha = parts[0], parts[1]
+    rec = _find_rec(sid)
+    if not rec:
+        return json.dumps({"ok": False, "error": f"no evidence record for {sid}"})
+    snap = next((s for s in rec.get("snaps") or [] if s.get("sha") == sha), None)
+    if not snap:
+        return json.dumps({"ok": False, "error": f"snapshot {sha[:10]} not found for {sid}"})
+    root = snap.get("root") or rec.get("_root")
+    try:
+        # tracked + staged content restored; files created after the snap stay
+        out = _git(root, "restore", f"--source={sha}", "--worktree", "--staged", "--",
+                   ":/", timeout=30)
+        if out.returncode != 0:
+            return json.dumps({"ok": False, "error": out.stderr.strip()[:300]})
+        return json.dumps({
+            "ok": True, "sha": sha, "n": snap.get("n"), "root": root,
+            "note": "tracked files restored to the snapshot; files created after "
+                    "it remain (git clean them if unwanted)"})
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)[:200]})
+
+
+# ---------------------------------------------------------------------------
+# /day-impact — blast-radius scan over touched files
+# ---------------------------------------------------------------------------
+
+_PY_DEF_RE = re.compile(r"^\s*(?:async\s+def|def|class)\s+([A-Za-z_]\w*)", re.M)
+_JS_DEF_RE = re.compile(
+    r"(?:export\s+)?(?:async\s+)?(?:function\*?|class)\s+([A-Za-z_$][\w$]*)|"
+    r"(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?"
+    r"(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>",
+    re.M,
+)
+_IMPORT_RE = {
+    "py": re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", re.M),
+    "js": re.compile(r"(?:import|require)\s*\(?\s*['\"]([^'\"]+)['\"]", re.M),
+}
+_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist",
+              "build", ".next", "target", "vendor", ".tox", "coverage"}
+
+
+def _symbols_of(path: str) -> list:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(400_000)
+    except OSError:
+        return []
+    if path.endswith(".py"):
+        return list(dict.fromkeys(_PY_DEF_RE.findall(text)))[:24]
+    if re.search(r"\.(jsx?|tsx?|mjs|cjs)$", path):
+        flat = []
+        for a, b in _JS_DEF_RE.findall(text):
+            flat.append(a or b)
+        return list(dict.fromkeys(flat))[:24]
+    return []
+
+
+def _module_tokens(path: str, root: str) -> list:
+    """Import-addressable tokens for a file: dotted module + basename stems."""
+    rel = os.path.relpath(path, root)
+    stem, _ext = os.path.splitext(rel)
+    toks = []
+    if path.endswith(".py"):
+        dotted = stem.replace(os.sep, ".").replace(".__init__", "")
+        toks.append(dotted)
+        toks.append(os.path.basename(stem))
+    else:
+        base = os.path.basename(stem)
+        toks.append(stem)        # ./src/foo/bar import style
+        toks.append(base)
+    return [t for t in toks if t and t not in ("__init__", "index")]
+
+
+def _tracked_files(root: str) -> list:
+    try:
+        out = _git(root, "ls-files", timeout=15)
+        if out.returncode == 0:
+            return [os.path.join(root, l) for l in out.stdout.splitlines() if l.strip()]
+    except Exception:
+        pass
+    out = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for name in files:
+            out.append(os.path.join(dirpath, name))
+        if len(out) > 20000:
+            break
+    return out
+
+
+def _is_test_file(path: str) -> bool:
+    return bool(_TEST_PATH_RE.search(path))
+
+
+def _test_cover_for(dep_path: str, root: str, tests: list) -> bool:
+    """Does any test file plausibly exercise this dependent? Name + import heuristics."""
+    stem = os.path.splitext(os.path.basename(dep_path))[0]
+    for t in tests:
+        tb = os.path.basename(t)
+        if stem and stem in tb:
+            return True
+        try:
+            with open(t, encoding="utf-8", errors="replace") as fh:
+                if stem and re.search(r"\b" + re.escape(stem) + r"\b", fh.read(300_000)):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _impact_scan(rec: Dict[str, Any]) -> Dict[str, Any]:
+    files = [f for f in (rec.get("files") or []) if isinstance(f, str)]
+    roots = {}
+    for f in files:
+        root = _repo_root(f)
+        if root:
+            roots.setdefault(root, []).append(f)
+    if not roots:
+        root = rec.get("_root")
+        if root:
+            roots[root] = []
+    out_roots = []
+    for root, touched in roots.items():
+        tracked = _tracked_files(root)
+        tests = [t for t in tracked if _is_test_file(t)]
+        touched_rows = []
+        dependents: Dict[str, set] = {}
+        for f in touched:
+            symbols = _symbols_of(f)
+            touched_rows.append({"path": os.path.relpath(f, root), "symbols": symbols})
+            tokens = _module_tokens(f, root) + symbols[:12]
+            for other in tracked:
+                if other == f or not re.search(r"\.(py|jsx?|tsx?|mjs|cjs)$", other):
+                    continue
+                try:
+                    with open(other, encoding="utf-8", errors="replace") as fh:
+                        body = fh.read(400_000)
+                except OSError:
+                    continue
+                hits = {tok for tok in tokens
+                        if len(tok) >= 3 and re.search(r"\b" + re.escape(tok) + r"\b", body)}
+                if hits:
+                    dependents.setdefault(other, set()).update(hits)
+        dep_rows = [{
+            "path": os.path.relpath(p, root),
+            "calls": sorted(c for c in calls if not os.sep in c)[:10],
+            "is_test": _is_test_file(p),
+            "covered": _is_test_file(p) or _test_cover_for(p, root, tests),
+        } for p, calls in sorted(dependents.items())]
+        out_roots.append({"root": root, "touched": touched_rows, "dependents": dep_rows})
+    return {"roots": out_roots}
+
+
+def _cmd_impact(arg: str = "") -> str:
+    sid = (arg or "").strip()
+    if not sid:
+        return json.dumps({"ok": False, "error": "usage: day-impact <session_key>"})
+    rec = _find_rec(sid)
+    if not rec:
+        return json.dumps({"ok": False, "error": f"no evidence record for {sid}"})
+    try:
+        result = _impact_scan(rec)
+        return json.dumps({"ok": True, **result})
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)[:200]})
 
 
 # ---------------------------------------------------------------------------
@@ -463,4 +771,14 @@ def register(ctx: Any) -> None:
         "day-evidence", _cmd_evidence,
         description="Evidence-gate verdicts as JSON (arg: optional session key).",
         args_hint="[session_key]",
+    )
+    ctx.register_command(
+        "day-rollback", _cmd_rollback,
+        description="Restore the worktree to a Hermes Day turn snapshot.",
+        args_hint="<session_key> <sha>",
+    )
+    ctx.register_command(
+        "day-impact", _cmd_impact,
+        description="Blast-radius scan: touched symbols, dependents, coverage.",
+        args_hint="<session_key>",
     )
