@@ -500,3 +500,198 @@ def test_failed_check_promotes_a_usable_trigger(day, repo):
     assert instincts, "a failing check should have promoted an instinct"
     assert instincts[0]["trigger_pattern"] == "pytest"
     assert instincts[0]["trigger_pattern"] not in module._NAV_SEGMENTS
+
+
+# ---------------------------------------------------------------------------
+# generated-path exclusion (regression: `rm -rf __pycache__ tests/__pycache__`
+# was blocked as "deletes test files", which trains operators to route around
+# the guard — worse than the false positive itself)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path,generated", [
+    ("/repo/tests/__pycache__/test_a.cpython-311.pyc", True),
+    ("tests/__pycache__", True),
+    ("node_modules/jest-x/test_thing.js", True),
+    (".pytest_cache/v/cache/lastfailed", True),
+    ("/repo/.venv/lib/test_helpers.py", True),
+    ("/repo/tests/test_approval_ledger.py", False),
+    ("/repo/src/test_util.py", False),
+    ("tests/fixtures/test_data.json", False),
+    ("/repo/app.test.ts", False),
+])
+def test_generated_path_detection(day, path, generated):
+    module, _, _ = day
+    assert module._is_generated_path(path) is generated
+
+
+@pytest.mark.parametrize("command", [
+    "rm -rf __pycache__ tests/__pycache__",
+    "rm -rf .pytest_cache tests/__pycache__ node_modules/.cache",
+    "find . -name __pycache__ -exec rm -rf {} +",
+    "rm -rf build dist coverage",
+])
+def test_cache_cleanup_is_not_test_deletion(day, command):
+    module, _, _ = day
+    assert module._command_violation(command) is None, command
+
+
+@pytest.mark.parametrize("command", [
+    "rm -rf tests/",
+    "rm -f tests/unit/test_a.py",
+    "git rm tests/test_x.py",
+    "> tests/test_x.py",
+    "sed -i 's/assert/print/' tests/test_x.py",
+])
+def test_real_test_tampering_still_blocked(day, command):
+    module, _, _ = day
+    assert module._command_violation(command) is not None, command
+
+
+def test_cache_cleanup_mixed_with_real_tests_is_blocked(day):
+    """Dropping generated words must not blind the rule to a real test path."""
+    module, _, _ = day
+    assert module._command_violation("rm -rf __pycache__ tests/") is not None
+
+
+def test_generated_test_file_is_not_assertion_guarded(day):
+    """Editing a .pyc under __pycache__ must not trip assertion gutting."""
+    module, _, _ = day
+    assert module._edit_violation("tests/__pycache__/test_a.py",
+                                  {"old_string": "assert x\n", "new_string": ""}) is None
+
+
+# ---------------------------------------------------------------------------
+# guard canary — proves the gate is alive AND not over-blocking
+# ---------------------------------------------------------------------------
+
+
+def test_canary_reports_healthy(day):
+    module, _, _ = day
+    result = module._canary(force=True)
+    assert result["ok"] is True, f"canary failed: {result['failed']}"
+    assert result["degraded"] is False
+
+
+def test_canary_covers_both_directions(day):
+    module, _, _ = day
+    result = module._canary(force=True)
+    expectations = {c["expect"] for c in result["cases"]}
+    assert expectations == {"blocked", "allowed"}, "canary must test both directions"
+
+
+def test_canary_detects_a_dead_gate(day, monkeypatch):
+    """A guard that has silently stopped enforcing must report DEGRADED."""
+    module, _, _ = day
+    monkeypatch.setattr(module, "_command_violation", lambda cmd: None)
+    result = module._canary(force=True)
+    assert result["ok"] is False
+    assert result["degraded"] is True
+    assert "deletes tests" in result["failed"]
+
+
+def test_canary_detects_over_blocking(day, monkeypatch):
+    """A guard that blocks everything must also report DEGRADED."""
+    module, _, _ = day
+    monkeypatch.setattr(module, "_command_violation",
+                        lambda cmd: ("blocked", "Test Deletion"))
+    result = module._canary(force=True)
+    assert result["ok"] is False
+    assert "cache cleanup" in result["failed"]
+
+
+def test_canary_detects_a_raising_gate(day, monkeypatch):
+    module, _, _ = day
+
+    def boom(cmd):
+        raise RuntimeError("guard exploded")
+
+    monkeypatch.setattr(module, "_command_violation", boom)
+    result = module._canary(force=True)
+    assert result["ok"] is False
+    assert any("raised RuntimeError" in c["rule"] for c in result["cases"])
+
+
+def test_canary_is_cached_then_force_refreshes(day, monkeypatch):
+    module, _, _ = day
+    first = module._canary(force=True)
+    monkeypatch.setattr(module, "_command_violation", lambda cmd: None)
+    assert module._canary() is first, "should serve the cached verdict inside its TTL"
+    assert module._canary(force=True)["ok"] is False, "force must re-run"
+
+
+def test_guard_command_and_evidence_expose_canary(day):
+    module, ctx, sid = day
+    assert "day-guard" in ctx.commands
+    payload = json.loads(module._cmd_guard("force"))
+    assert payload["ok"] is True
+    evidence = json.loads(module._cmd_evidence())
+    assert evidence["guard"]["ok"] is True
+
+
+def test_guard_still_blocks_and_canary_never_raises_on_bad_input(day):
+    module, _, sid = day
+    assert module._pre_tool_call(tool_name="terminal", args={"command": "rm -rf tests/"},
+                                 session_id=sid) is not None
+    for junk in ("", "   ", "\x00", "rm", ">"):
+        module._command_violation(junk)
+    assert module._canary(force=True)["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# rollback insurance — a restore must itself be reversible
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_creates_an_insurance_snapshot(day, repo):
+    module, _, sid = day
+    rec = module._SESSIONS[sid]
+    # _snapshot no-ops on a clean tree, so dirty it first (baseline = x = 5)
+    (repo / "a.py").write_text("x = 5\n")
+    with module._LOCK:
+        module._snapshot(rec, sid, str(repo), "turn 1")
+    assert rec["snaps"], "baseline snapshot should exist"
+    first = rec["snaps"][-1]["sha"]
+
+    (repo / "a.py").write_text("x = 999\n")
+    out = json.loads(module._cmd_rollback(f"{sid} {first}"))
+
+    assert out["ok"] is True, out
+    assert out["insurance"], "a rollback must leave a way back"
+    assert out["insurance"] != first
+    assert "undoes this restore" in out["note"]
+    # the restore actually happened
+    assert (repo / "a.py").read_text() == "x = 5\n"
+    # and the insurance snapshot captured the pre-rollback state
+    names = [s.get("label") for s in rec["snaps"]]
+    assert "pre-rollback" in names
+
+
+def test_rollback_can_be_undone(day, repo):
+    """Round trip: roll back, then roll the rollback back."""
+    module, _, sid = day
+    rec = module._SESSIONS[sid]
+    (repo / "a.py").write_text("x = 5\n")
+    with module._LOCK:
+        module._snapshot(rec, sid, str(repo), "turn 1")
+    first = rec["snaps"][-1]["sha"]
+
+    (repo / "a.py").write_text("x = 999\n")
+    out = json.loads(module._cmd_rollback(f"{sid} {first}"))
+    assert (repo / "a.py").read_text() == "x = 5\n"
+
+    undo = json.loads(module._cmd_rollback(f"{sid} {out['insurance']}"))
+    assert undo["ok"] is True, undo
+    assert (repo / "a.py").read_text() == "x = 999\n", "insurance did not restore"
+
+
+def test_rollback_of_unknown_snapshot_is_refused(day):
+    module, _, sid = day
+    out = json.loads(module._cmd_rollback(f"{sid} deadbeefdeadbeef"))
+    assert out["ok"] is False
+    assert "not found" in out["error"]
+
+
+def test_rollback_usage_error(day):
+    module, _, _ = day
+    assert json.loads(module._cmd_rollback(""))["ok"] is False

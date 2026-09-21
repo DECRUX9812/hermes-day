@@ -55,6 +55,12 @@ Companion to the desktop cockpit (``desktop/plugin.js``). Registers:
   genuinely new landed.
 - ``/day-approvals`` — the approval ledger (counts, stalls, denies, latency).
 - ``/day-attention`` — interruptions, provider errors, failed subagents.
+- ``/day-guard`` — guard self-test. Replays known-bad and known-benign commands
+  through the real predicates so a silently-dead gate (or one that has started
+  over-blocking) surfaces as DEGRADED instead of an absence of protection.
+  ``/day-evidence`` carries the same under ``guard``.
+- Rollback insurance — ``/day-rollback`` snapshots the current state first, so
+  a rollback is itself reversible rather than a one-way door.
 
 State: per-session records in ``ctx.state`` under the ``sessions`` key
 (capped, trimmed), plus an in-memory mirror for hot-path updates.
@@ -165,6 +171,30 @@ def _trigger_of(cmd: str) -> str:
 
 # Path-shaped token inside a shell command that smells like a test file/dir.
 _TEST_TOKEN = r"[^\s\"'`;&|]*(?:test|spec|conftest|__tests__|_test)[^\s\"'`;&|]*"
+
+# Generated / vendored directories. Cache cleanup under one of these is
+# housekeeping, not test tampering: blocking it teaches the operator to route
+# around the guard, which is worse than the false positive itself.
+_CACHE_DIRS = ("__pycache__", "pytest_cache", "mypy_cache", "ruff_cache",
+               "tox", "cache", "git", "node_modules", "dist", "build",
+               "target", "coverage", "next", "venv", "site-packages")
+
+
+def _is_generated_path(path: str) -> bool:
+    """True when any component is a generated or vendored directory."""
+    parts = [p.strip(".") for p in str(path or "").replace("\\", "/").split("/") if p]
+    return any(part in _CACHE_DIRS for part in parts)
+
+
+def _without_generated_paths(cmd: str) -> str:
+    """Drop words living under a generated directory before guard matching.
+
+    `rm -rf __pycache__ tests/__pycache__` is housekeeping, not test tampering,
+    and blocking it trains the operator to route around the guard.
+    """
+    return " ".join(w for w in str(cmd or "").split()
+                    if not _is_generated_path(w))
+
 
 _COMMAND_VIOLATIONS = (
     (
@@ -484,8 +514,9 @@ def _transform_tool_result(tool_name: str = "", args: Optional[Dict[str, Any]] =
 
 def _command_violation(cmd: str) -> Optional[tuple]:
     """(reason, rule) for a shell command that fakes a pass, else None."""
+    probe = _without_generated_paths(cmd)
     for pattern, reason, rule in _COMMAND_VIOLATIONS:
-        if pattern.search(cmd):
+        if pattern.search(probe):
             return reason, rule
     return None
 
@@ -519,7 +550,7 @@ def _read_existing(path: str) -> Optional[str]:
 
 
 def _edit_violation(path: str, args: Dict[str, Any]) -> Optional[str]:
-    if not path or not _TEST_PATH_RE.search(path):
+    if not path or not _TEST_PATH_RE.search(path) or _is_generated_path(path):
         return None
     edits = args.get("edits")
     if isinstance(edits, list) and edits:
@@ -579,11 +610,69 @@ def _block(sid: str, tool_name: str, reason: str, rule: str = "Honesty Guard",
     return {"action": "block", "message": message}
 
 
+# (label, command, must_block) — replayed through the real predicates.
+_CANARY_COMMANDS = (
+    ("deletes tests", "rm -rf tests/", True),
+    ("git rm a test", "git rm tests/test_x.py", True),
+    ("truncates a test", "> tests/test_x.py", True),
+    ("launders exit", "pytest -q || true", True),
+    ("empty-suite flag", "pytest --passWithNoTests", True),
+    ("cache cleanup", "rm -rf __pycache__ tests/__pycache__", False),
+    ("runs the suite", "pytest tests/ -q", False),
+    ("inspects state", "git status --short", False),
+)
+_CANARY_TTL = 300.0
+_CANARY: Dict[str, Any] = {}
+_CANARY_AT = 0.0
+
+
+def _canary(force: bool = False) -> Dict[str, Any]:
+    """Prove the honesty guard is enforcing — and not over-blocking.
+
+    Both failure modes matter. A guard that is silently dead is worse than no
+    guard at all (a mistyped path or a swallowed import leaves the gate open),
+    and one that trips on cache cleanup trains the operator to route around it,
+    which is worse still. Replaying a fixed table of known-bad and known-benign
+    cases through the real predicates makes both visible as a DEGRADED state in
+    the cockpit instead of a silent absence of protection.
+    """
+    global _CANARY, _CANARY_AT
+    now = time.time()
+    if _CANARY and not force and (now - _CANARY_AT) < _CANARY_TTL:
+        return _CANARY
+    cases = []
+    for label, cmd, must_block in _CANARY_COMMANDS:
+        try:
+            hit = _command_violation(cmd)
+            blocked, rule = bool(hit), (hit[1] if hit else "")
+        except Exception as exc:                      # a raising guard is a dead guard
+            blocked, rule = False, f"raised {type(exc).__name__}"
+        cases.append({"case": label, "blocked": blocked, "rule": rule,
+                      "expect": "blocked" if must_block else "allowed",
+                      "ok": blocked == must_block})
+    try:
+        edit = _edit_violation("tests/test_x.py",
+                               {"old_string": "assert a == 1\nassert b == 2\n",
+                                "new_string": "pass\n"})
+        cases.append({"case": "guts assertions", "blocked": bool(edit),
+                      "rule": edit or "", "expect": "blocked", "ok": bool(edit)})
+    except Exception as exc:
+        cases.append({"case": "guts assertions", "blocked": False,
+                      "rule": f"raised {type(exc).__name__}", "expect": "blocked",
+                      "ok": False})
+    failed = [c["case"] for c in cases if not c["ok"]]
+    _CANARY = {"ok": not failed, "degraded": bool(failed), "failed": failed,
+               "cases": cases, "checked_at": now}
+    _CANARY_AT = now
+    return _CANARY
+
+
 def _pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
                    session_id: str = "", **_kw: Any) -> Optional[Dict[str, str]]:
     try:
         if not _enabled("honesty"):
             return None
+        _canary()  # TTL-cached liveness probe for the gate itself
         args = args if isinstance(args, dict) else {}
         hit = None
         if tool_name == "terminal":
@@ -876,8 +965,9 @@ def _cmd_evidence(arg: str = "") -> str:
                     or r.get("approvals") or r.get("attn")}
     sid = (arg or "").strip()
     if sid:
-        return json.dumps({"ok": True, "sessions": {sid: sessions.get(sid)}})
-    return json.dumps({"ok": True, "sessions": sessions})
+        return json.dumps({"ok": True, "guard": _canary(),
+                           "sessions": {sid: sessions.get(sid)}})
+    return json.dumps({"ok": True, "guard": _canary(), "sessions": sessions})
 
 
 def _find_rec(sid: str) -> Optional[Dict[str, Any]]:
@@ -904,16 +994,28 @@ def _cmd_rollback(arg: str = "") -> str:
     if not snap:
         return json.dumps({"ok": False, "error": f"snapshot {sha[:10]} not found for {sid}"})
     root = snap.get("root") or rec.get("_root")
+    # Rollback insurance: capture the CURRENT state before restoring, so this
+    # restore is itself reversible. Cascade's and Roo's reverts are explicitly
+    # irreversible, which is the trap this avoids.
+    insurance = None
+    with _LOCK:
+        _snapshot(rec, sid, root or "", "pre-rollback")
+        if rec.get("snaps"):
+            insurance = rec["snaps"][-1].get("sha")
+        _persist()
     try:
         # tracked + staged content restored; files created after the snap stay
         out = _git(root, "restore", f"--source={sha}", "--worktree", "--staged", "--",
                    ":/", timeout=30)
         if out.returncode != 0:
-            return json.dumps({"ok": False, "error": out.stderr.strip()[:300]})
+            return json.dumps({"ok": False, "error": out.stderr.strip()[:300],
+                               "insurance": insurance})
         return json.dumps({
             "ok": True, "sha": sha, "n": snap.get("n"), "root": root,
+            "insurance": insurance,
             "note": "tracked files restored to the snapshot; files created after "
-                    "it remain (git clean them if unwanted)"})
+                    "it remain (git clean them if unwanted)"
+                    + (f"; {insurance[:10]} undoes this restore" if insurance else "")})
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)[:200]})
 
@@ -1410,6 +1512,11 @@ def _cmd_attention(arg: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 
+def _cmd_guard(arg: str = "") -> str:
+    """``[force]`` — guard liveness + over-blocking self-test."""
+    return json.dumps(_canary(force=bool((arg or "").strip())))
+
+
 def _enabled(section: str) -> bool:
     if _CTX is None:
         return True
@@ -1492,4 +1599,9 @@ def register(ctx: Any) -> None:
     ctx.register_command(
         "day-attention", _cmd_attention,
         description="Attention feed: interruptions, provider errors, failed subagents.",
+    )
+    ctx.register_command(
+        "day-guard", _cmd_guard,
+        description="Honesty-guard self-test: proves the gate blocks and is not over-blocking.",
+        args_hint="[force]",
     )
