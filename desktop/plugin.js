@@ -333,7 +333,7 @@ async function scanRoute(route) {
     if (sessions && typeof sessions === 'object') {
       const ev = { ...$evidence.get() }
       for (const [k, v] of Object.entries(sessions)) {
-        if (v && (v.verdict || v.runs || v.blocks || (v.snaps && v.snaps.length))) ev[`${source.key}#${k}`] = v
+        if (v && (v.verdict || v.runs || v.blocks || v.vacuum || (v.snaps && v.snaps.length))) ev[`${source.key}#${k}`] = v
       }
       $evidence.set(ev)
     }
@@ -1987,6 +1987,195 @@ function TurnScrubber({ turns, scrub, onScrub, onRevert, reverting, revertNote, 
   })
 }
 
+// Context X-Ray — rough token split of the session's context, estimated from
+// replay frames (chars/4). sys = prompt base + message bodies, files =
+// read/write/diff tool traffic, dumps = stdout/stderr tool results.
+const XRAY_BASE = 6000
+const XRAY_FILE_TOOLS = new Set([
+  'write_file', 'edit_file', 'multi_edit', 'patch', 'apply_patch',
+  'read_file', 'view_file', 'str_replace_editor'
+])
+
+function xrayFromEvents(events) {
+  let sys = XRAY_BASE * 4, files = 0, dumps = 0
+  for (const ev of events || []) {
+    const t = evType(ev)
+    if (t === 'message.start' || t === 'message.complete') {
+      sys += String(ev.text || ev.final || '').length
+    } else if (t === 'tool.start' || t === 'tool.complete') {
+      const argChars = String(ev.args_text || (ev.args ? JSON.stringify(ev.args) : '')).length
+      const resChars = String(ev.result_text || ev.summary || (typeof ev.result === 'string' ? ev.result : '')).length
+      if (XRAY_FILE_TOOLS.has(ev.name) || ev.inline_diff)
+        files += argChars + resChars + String(ev.inline_diff || '').length
+      else dumps += argChars + resChars
+    }
+  }
+  return { sys: Math.round(sys / 4), files: Math.round(files / 4), dumps: Math.round(dumps / 4) }
+}
+
+const fmtTok = n => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`)
+
+function XrayBar({ events, ev, storedId, route }) {
+  const seg = xrayFromEvents(events)
+  const total = seg.sys + seg.files + seg.dumps || 1
+  const vac = (ev && ev.vacuum) || null
+  const savedTok = vac && vac.saved_chars ? Math.round(vac.saved_chars / 4) : 0
+  const dumpBase = seg.dumps + savedTok
+  const recoveredPct = savedTok && dumpBase ? Math.min(99, Math.round((savedTok / dumpBase) * 100)) : 0
+  const [arming, setArming] = useState(false)
+  const arm = async () => {
+    if (!storedId) return
+    setArming(true)
+    try {
+      await rpc(route, 'command.dispatch', { name: 'day-vacuum', arg: storedId })
+      invalidate()
+    } catch {} finally {
+      setArming(false)
+    }
+  }
+  const segRow = (label, v, color) =>
+    jsxs('span', {
+      className: 'flex items-center gap-1 whitespace-nowrap',
+      children: [
+        jsx('span', { className: 'size-1.5 rounded-sm', style: { background: color } }),
+        jsx('span', { style: { color: C.faint }, children: label }),
+        jsx('span', { className: 'font-mono', style: { color: C.muted }, children: `~${fmtTok(v)}` })
+      ]
+    })
+  return jsxs('div', {
+    className: 'shrink-0 px-3 pb-1.5 pt-1',
+    children: [
+      jsxs('div', {
+        className: 'flex h-1 overflow-hidden rounded-full',
+        style: { background: C.border },
+        children: [
+          jsx('span', { style: { width: `${Math.max(3, (seg.sys / total) * 100)}%`, background: '#64748b' } }),
+          jsx('span', { style: { width: `${Math.max(0, (seg.files / total) * 100)}%`, background: C.mono } }),
+          jsx('span', { style: { width: `${Math.max(0, (seg.dumps / total) * 100)}%`, background: C.amber } })
+        ]
+      }),
+      jsxs('div', {
+        className: 'mt-1 flex items-center gap-2.5 text-[0.58rem]',
+        children: [
+          jsx('span', { className: 'uppercase tracking-wider', style: { color: C.faint }, children: 'ctx' }),
+          segRow('sys', seg.sys, '#64748b'),
+          segRow('files', seg.files, C.mono),
+          segRow('dumps', seg.dumps, C.amber),
+          recoveredPct
+            ? jsx('span', { className: 'font-mono', style: { color: C.emerald }, children: `▼ ${recoveredPct}% recovered` })
+            : null,
+          jsx('div', { className: 'flex-1' }),
+          vac && vac.trimmed
+            ? jsx('span', { className: 'font-mono', style: { color: C.emerald }, children: `${vac.trimmed} trimmed` })
+            : null,
+          jsx('button', {
+            className: 'hday-chip rounded border px-1.5 py-px font-mono text-[0.6rem]',
+            style: {
+              borderColor: vac && vac.armed ? C.emerald : C.border,
+              color: vac && vac.armed ? C.emerald : C.muted
+            },
+            disabled: !storedId || arming || (vac && vac.armed),
+            onClick: arm,
+            children: arming ? 'arming…' : vac && vac.armed ? 'vacuum armed' : '⌀ vacuum ctx'
+          })
+        ]
+      })
+    ]
+  })
+}
+
+// Negative instincts — per-repo ledger of blocked/failed approaches, injected
+// into the agent's first-turn context by the backend half.
+function InstinctsDrawer({ open, onClose, route }) {
+  const instQ = useQuery({
+    queryKey: ['hday-instincts'],
+    queryFn: async () => {
+      const disp = await rpc(route, 'command.dispatch', { name: 'day-instincts', arg: '' })
+      const out = disp && (disp.output || disp.text || '')
+      return out && out.trim().startsWith('{') ? JSON.parse(out) : { ok: false }
+    },
+    enabled: open,
+    refetchInterval: 10000,
+    staleTime: 4000
+  })
+  const act = async (name, arg) => {
+    try {
+      await rpc(route, 'command.dispatch', { name, arg })
+      queryClient.invalidateQueries({ queryKey: ['hday-instincts'] })
+    } catch {}
+  }
+  if (!open) return null
+  const repos = (instQ.data && instQ.data.repos) || {}
+  const roots = Object.keys(repos).sort()
+  const totalEnabled = roots.reduce((n, r) => n + repos[r].filter(i => i.enabled !== false).length, 0)
+  return jsxs('div', {
+    className: 'absolute right-0 top-0 z-30 flex h-full w-[380px] flex-col',
+    style: { background: C.canvas, borderLeft: `1px solid ${C.border}` },
+    children: [
+      jsxs('div', {
+        className: 'flex shrink-0 items-center gap-2 px-3 py-2.5',
+        style: { borderBottom: `1px solid ${C.border}` },
+        children: [
+          jsx(Codicon, { name: 'lightbulb', style: { color: C.amber } }),
+          jsx('span', { className: 'flex-1 truncate text-[0.78rem] font-semibold', style: { color: C.text }, children: 'Repo instincts' }),
+          totalEnabled ? jsx(Badge, { variant: 'warn', children: `${totalEnabled} active` }) : null,
+          jsx(Button, { size: 'icon-sm', variant: 'ghost', onClick: onClose, children: jsx(Codicon, { name: 'close' }) })
+        ]
+      }),
+      jsx('div', { className: 'px-3 py-2 text-[0.64rem] leading-4', style: { color: C.faint, borderBottom: `1px solid ${C.border}` },
+        children: 'Approaches already disproven in each repo — injected into new sessions so Hermes never repeats them. Toggling takes effect on the next session.' }),
+      jsx(ScrollArea, {
+        className: 'min-h-0 flex-1',
+        children: jsxs('div', {
+          className: 'flex flex-col gap-3 p-3',
+          children: [
+            instQ.isLoading ? jsxs('div', { className: 'flex items-center gap-2 py-4', style: { color: C.faint }, children: [jsx(Loader, {}), jsx('span', { className: 'text-[0.72rem]', children: 'Loading ledgers…' })] }) : null,
+            !instQ.isLoading && !roots.length
+              ? jsx('div', { className: 'py-6 text-center text-[0.72rem]', style: { color: C.faint }, children: 'No instincts yet — blocked traps and failed checks promote themselves here automatically.' })
+              : null,
+            roots.map(root => jsxs('div', {
+              className: 'flex flex-col gap-1.5',
+              children: [
+                jsx('div', { className: 'truncate font-mono text-[0.6rem]', style: { color: C.faint }, children: root }),
+                ...repos[root].map(i => jsxs('div', {
+                  className: 'rounded border px-2 py-1.5',
+                  style: { borderColor: C.border, background: C.surface, opacity: i.enabled === false ? 0.45 : 1 },
+                  children: [
+                    jsxs('div', {
+                      className: 'flex items-start gap-2',
+                      children: [
+                        jsx('button', {
+                          className: 'mt-px shrink-0 rounded border',
+                          style: { width: 12, height: 12, borderColor: i.enabled === false ? C.border : C.amber, background: i.enabled === false ? 'transparent' : C.amber },
+                          onClick: () => act('day-instinct-set', `${root} ${i.id} ${i.enabled === false ? 1 : 0}`)
+                        }),
+                        jsx('div', {
+                          className: 'min-w-0 flex-1',
+                          children: [
+                            jsx('div', { className: 'break-all font-mono text-[0.66rem]', style: { color: C.text }, children: i.trigger_pattern }),
+                            jsx('div', { className: 'break-all font-mono text-[0.6rem]', style: { color: C.mono }, children: i.disproven_approach }),
+                            jsx('div', { className: 'mt-0.5 text-[0.62rem]', style: { color: C.muted }, children: i.reason })
+                          ]
+                        }),
+                        i.hits > 1 ? jsx('span', { className: 'shrink-0 rounded border px-1 font-mono text-[0.58rem]', style: { borderColor: C.border, color: C.amber }, children: `x${i.hits}` }) : null,
+                        jsx(Button, {
+                          size: 'icon-xs', variant: 'ghost', className: 'shrink-0',
+                          onClick: () => act('day-instinct-del', `${root} ${i.id}`),
+                          children: jsx(Codicon, { name: 'trash', className: 'text-[0.6rem]', style: { color: C.faint } })
+                        })
+                      ]
+                    })
+                  ]
+                }, i.id))
+              ]
+            }, root))
+          ]
+        })
+      })
+    ]
+  })
+}
+
 function ImpactView({ data, loading }) {
   if (loading) return jsxs('div', { className: 'flex items-center gap-2 px-3 py-6', style: { color: C.faint }, children: [jsx(Loader, {}), jsx('span', { className: 'text-[0.72rem]', children: 'Scanning blast radius…' })] })
   const roots = (data && data.roots) || []
@@ -2576,6 +2765,7 @@ function Inspector({ e, evMap }) {
           })
         ]
       }),
+      jsx(XrayBar, { events: allEvents, ev, storedId, route }),
       jsx(TurnScrubber, {
         turns, scrub, snaps: ev && ev.snaps, reverting, revertNote,
         onScrub: setScrub, onRevert: revertTo
@@ -2620,6 +2810,7 @@ function DayPage() {
   const [sel, setSel] = useState(0)
   const [celebrate, setCelebrate] = useState(false)
   const [focus, setFocus] = useState(false)
+  const [instOpen, setInstOpen] = useState(false)
   const prevNeeds = useRef(null)
   const pinnedMap = useValue($pinned)
   const undo = useValue($undo)
@@ -2790,6 +2981,15 @@ function DayPage() {
                     ]
                   })
                 : null,
+              jsx(Tip, {
+                label: 'Repo instincts — disproven approaches Hermes remembers',
+                children: jsx(Button, {
+                  size: 'icon-sm',
+                  variant: 'ghost',
+                  onClick: () => { setInstOpen(v => !v); haptic('selection') },
+                  children: jsx(Codicon, { name: 'lightbulb', className: instOpen ? '' : 'text-muted-foreground' })
+                })
+              }),
               jsx(Tip, {
                 label: prefs.notify ? 'Notifications on — click to mute' : 'Notifications off — click to enable',
                 children: jsx(Button, {
@@ -3007,9 +3207,16 @@ function DayPage() {
           }),
           // RIGHT — the live inspector
           jsxs('section', {
-            className: 'flex min-w-0 flex-1 flex-col',
+            className: 'relative flex min-w-0 flex-1 flex-col',
             style: { background: '#0e1117' },
-            children: [jsx(Inspector, { e: selEntry, evMap })]
+            children: [
+              jsx(Inspector, { e: selEntry, evMap }),
+              jsx(InstinctsDrawer, {
+                open: instOpen,
+                onClose: () => setInstOpen(false),
+                route: sources.length ? sources[0].route : null
+              })
+            ]
           })
         ]
       }),

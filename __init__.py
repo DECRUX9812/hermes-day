@@ -18,11 +18,21 @@ Companion to the desktop cockpit (``desktop/plugin.js``). Registers:
   commit-tree plumbing on a throwaway index; the worktree and the user's
   real index are never touched. Powers the inspector's turn scrubber.
 - ``/day-evidence`` — JSON verdict map (verdicts, runs, trap ledger,
-  snapshots) the desktop half polls via ``command.dispatch``.
+  snapshots, vacuum stats) the desktop half polls via ``command.dispatch``.
 - ``/day-rollback`` — ``<session_key> <sha>``: restores the worktree to a
   turn snapshot (``git restore --source``).
 - ``/day-impact`` — ``<session_key>``: blast-radius scan — symbols touched,
   downstream dependents, and which dependents lack test coverage.
+- Negative instincts — guard blocks and non-zero-exit commands are promoted
+  into ``<repo>/.hermes/instincts.json``; a ``hermes_day.instincts`` system
+  prompt section injects the enabled set into every new session prompt
+  (frozen at session start, byte-stable thereafter) so past mistakes are not
+  repeated across days. Managed via ``/day-instincts``,
+  ``/day-instinct-set`` (toggle), ``/day-instinct-del``.
+- ``transform_tool_result`` — context vacuum. When a session is armed via
+  ``/day-vacuum <session_key>`` (or the cockpit button), verbose terminal
+  outputs are archived to disk and replaced with a compact placeholder
+  before they enter context.
 
 State: per-session records in ``ctx.state`` under the ``sessions`` key
 (capped, trimmed), plus an in-memory mirror for hot-path updates.
@@ -40,15 +50,22 @@ import time
 from typing import Any, Dict, Optional
 
 _STATE_KEY = "sessions"
+_INDEX_KEY = "instinct_index"   # ctx.state key: {"repos": [repo_root, ...]}
 _MAX_SESSIONS = 60
 _MAX_RUNS = 20
 _MAX_BLOCKS = 20
 _MAX_SNAPS = 25
-_MAX_VERIFY_NUDGES = 2  # self-throttle; framework caps at agent.max_verify_nudges
+_MAX_INSTINCTS = 60             # per repo ledger
+_MAX_VERIFY_NUDGES = 2          # self-throttle; framework caps at agent.max_verify_nudges
+_VACUUM_MIN_LINES = 40          # results longer than this get trimmed when armed
+_VACUUM_HEAD = 6
+_VACUUM_TAIL = 3
 
 _CTX = None  # PluginContext, set in register()
 _LOCK = threading.RLock()
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
+_VACUUM_ARMED: set = set()      # session_ids with context vacuum armed
+_INSTINCT_CACHE: Dict[str, list] = {}  # repo_root -> instincts (enabled ones first)
 
 # ---------------------------------------------------------------------------
 # Detection tables
@@ -174,6 +191,210 @@ def _load_persisted() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Negative instincts — persistent per-repo ledger of disproven approaches
+# ---------------------------------------------------------------------------
+
+
+def _instincts_path(root: str) -> str:
+    return os.path.join(root, ".hermes", "instincts.json")
+
+
+def _load_instincts(root: str) -> list:
+    try:
+        with open(_instincts_path(root), encoding="utf-8") as fh:
+            data = json.load(fh)
+        items = data.get("instincts") if isinstance(data, dict) else data
+        return [i for i in (items or []) if isinstance(i, dict)]
+    except (OSError, ValueError):
+        return []
+
+
+def _save_instincts(root: str, items: list) -> None:
+    try:
+        os.makedirs(os.path.join(root, ".hermes"), exist_ok=True)
+        tmp = _instincts_path(root) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"instincts": items[-_MAX_INSTINCTS:]}, fh, indent=1)
+        os.replace(tmp, _instincts_path(root))
+    except OSError:
+        pass
+
+
+def _instinct_roots() -> list:
+    """All repo roots with known ledgers — in-memory cache + persisted index."""
+    roots = set(_INSTINCT_CACHE)
+    if _CTX is not None:
+        try:
+            idx = _CTX.state.get(_INDEX_KEY) or {}
+            roots.update(r for r in idx.get("repos", []) if isinstance(r, str))
+        except Exception:
+            pass
+    return sorted(roots)
+
+
+def _remember_root(root: str) -> None:
+    if not root:
+        return
+    _INSTINCT_CACHE.setdefault(root, [])
+    if _CTX is None:
+        return
+    try:
+        idx = _CTX.state.get(_INDEX_KEY) or {"repos": []}
+        repos = idx.get("repos") or []
+        if root not in repos:
+            repos.append(root)
+            _CTX.state.set(_INDEX_KEY, {"repos": repos[-40:]})
+    except Exception:
+        pass
+
+
+def _promote_instinct(rec: Dict[str, Any], root: Optional[str], trigger: str,
+                      approach: str, reason: str) -> None:
+    """Promote a trap/failed command into the repo's instincts ledger.
+
+    Dedupes on (trigger, approach); bumps `hits` on repeats. Caller holds _LOCK.
+    """
+    if not root:
+        root = rec.get("_root") or next(
+            (_repo_root(f) for f in reversed(rec.get("files") or []) if _repo_root(f)), None)
+    if not root:
+        try:  # ambient session cwd — covers sessions whose edits were all blocked
+            from agent.runtime_cwd import resolve_context_cwd
+            c = resolve_context_cwd()
+            root = _repo_root(str(c)) if c else None
+        except Exception:
+            root = None
+    if not root:
+        return
+    _remember_root(root)
+    items = _load_instincts(root)
+    hit = next((i for i in items if i.get("trigger_pattern") == trigger
+                and i.get("disproven_approach") == approach), None)
+    if hit:
+        hit["hits"] = int(hit.get("hits") or 1) + 1
+        hit["reason"] = reason or hit.get("reason", "")
+    else:
+        items.append({
+            "id": f"i{int(time.time() * 1000) % 10**9:x}",
+            "trigger_pattern": trigger[:160],
+            "disproven_approach": approach[:240],
+            "reason": reason[:240],
+            "enabled": True, "hits": 1, "created": time.time(),
+        })
+    _INSTINCT_CACHE[root] = items
+    _save_instincts(root, items)
+
+
+def _instincts_block(cwd: str = "") -> str:
+    """Constraint block from instinct ledgers, scoped to the cwd's repo when it
+    resolves (else every known ledger). Frozen into each new system prompt via
+    register_system_prompt_section — byte-stable for the conversation's life."""
+    roots = _instinct_roots()
+    scoped = _repo_root(cwd) if cwd else None
+    if scoped and scoped in roots:
+        roots = [scoped]
+    lines = []
+    for root in roots:
+        items = [i for i in _load_instincts(root) if i.get("enabled", True)]
+        if not items:
+            continue
+        lines.append(f"In {os.path.basename(root) or root} ({root}):")
+        for i in items[:8]:
+            lines.append(f"- NEVER {i.get('trigger_pattern', '')} — "
+                         f"{i.get('reason', 'previously failed')} "
+                         f"(approach tried: `{i.get('disproven_approach', '')[:70]}`)")
+    if not lines:
+        return ""
+    return ("[Hermes Day — negative instincts from this repo's history]\n" +
+            "\n".join(lines[:16]) +
+            "\nDo not retry these; they were already blocked or failed here.")
+
+
+def _instincts_section(session_info: Dict[str, Any]) -> str:
+    try:
+        if not _enabled("instincts"):
+            return ""
+        return _instincts_block(str((session_info or {}).get("cwd") or ""))
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Context vacuum — transform_tool_result trims verbose dumps once armed
+# ---------------------------------------------------------------------------
+
+_VACUUM_TOOLS = {"terminal", "bash", "execute_code", "run_command",
+                 "shell", "powershell", "cmd"}
+
+
+def _vacuum_dir(sid: str) -> str:
+    try:
+        from hermes_constants import get_hermes_home
+        base = os.path.join(get_hermes_home(), "plugin-data", "hermes-day", "vacuum")
+    except Exception:
+        base = os.path.join(os.path.expanduser("~"), ".hermes", "plugin-data",
+                            "hermes-day", "vacuum")
+    return os.path.join(base, sid or "_unknown")
+
+
+_DUMP_FIELDS = ("stdout", "stderr", "output", "result", "text", "log")
+
+
+def _transform_tool_result(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
+                           result: Any = None, session_id: str = "",
+                           **_kw: Any) -> Optional[str]:
+    """Replace verbose tool dumps with a pointer to the on-disk archive.
+
+    Results usually arrive as a JSON envelope (``{"stdout": ..., "exit": 0}``)
+    — one physical line — so the line test runs on the biggest string field
+    inside the payload, and the field is replaced while the envelope survives.
+    """
+    try:
+        if session_id not in _VACUUM_ARMED or not _enabled("vacuum"):
+            return None
+        if tool_name not in _VACUUM_TOOLS or not isinstance(result, str):
+            return None
+        body = None
+        try:
+            parsed = json.loads(result)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            field = max((f for f in _DUMP_FIELDS if isinstance(parsed.get(f), str)),
+                        key=lambda f: len(parsed[f]), default=None)
+            body = parsed.get(field) if field else None
+        else:
+            field = None
+            body = result
+        if not isinstance(body, str):
+            return None
+        lines = body.splitlines()
+        if len(lines) <= _VACUUM_MIN_LINES:
+            return None
+        root = _vacuum_dir(session_id)
+        os.makedirs(root, exist_ok=True)
+        n = int(time.time() * 1000) % 10**8
+        path = os.path.join(root, f"dump-{n}.log")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(result if isinstance(result, str) else str(result))
+        kept = lines[:_VACUUM_HEAD] + lines[-_VACUUM_TAIL:]
+        code = parsed.get("exit_code") if isinstance(parsed, dict) else None
+        marker = (f"\n[Trimmed stdout: exit {code if code is not None else '?'}, "
+                  f"{len(lines)} lines cached at {path}]")
+        trimmed = "\n".join(kept) + marker
+        out = trimmed if field is None else json.dumps({**parsed, field: trimmed})
+        with _LOCK:
+            rec = _rec(session_id)
+            vac = rec.setdefault("vacuum", {"armed": True, "trimmed": 0, "saved_chars": 0})
+            vac["trimmed"] += 1
+            vac["saved_chars"] += max(0, len(body) - len(trimmed))
+            _persist()
+        return out
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Honesty guard
 # ---------------------------------------------------------------------------
 
@@ -266,6 +487,11 @@ def _block(sid: str, tool_name: str, reason: str, rule: str = "Honesty Guard",
         rec["verdict"] = "flagged"
         rec["detail"] = f"honesty guard x{len(rec['blocks'])}"
         rec["at"] = time.time()
+        # promote the trap into the repo's negative-instincts ledger
+        path = next((str((args or {}).get(k) or "") for k in _PATH_KEYS
+                     if (args or {}).get(k)), "")
+        _promote_instinct(rec, _repo_root(path), rule or reason,
+                          _call_preview(tool_name, args or {}), reason)
         _persist()
     return {"action": "block", "message": message}
 
@@ -354,6 +580,12 @@ def _post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
             code = _exit_code(result, status)
             _append(rec["runs"], {"cmd": cmd[:240], "exit": code,
                                   "ok": code == 0, "ts": time.time()}, _MAX_RUNS)
+            # non-zero exits become negative instincts for the repo — but only
+            # for check/build-ish commands a future turn might blindly retry
+            if code not in (None, 0) and _CHECK_RE.search(cmd):
+                _promote_instinct(rec, None,
+                                  cmd.strip().split(" ", 1)[0][:80],
+                                  cmd[:240], f"exited {code}")
             _persist()
     except Exception:
         return
@@ -546,13 +778,15 @@ def _public_rec(rec: Dict[str, Any]) -> Dict[str, Any]:
         "snaps": [{"n": s.get("n"), "sha": s.get("sha"), "label": s.get("label"),
                    "root": s.get("root"), "ts": s.get("ts")}
                   for s in (rec.get("snaps") or [])],
+        "vacuum": dict(rec.get("vacuum") or {}),
     }
 
 
 def _cmd_evidence(arg: str = "") -> str:
     with _LOCK:
         sessions = {sid: _public_rec(r) for sid, r in _SESSIONS.items()
-                    if r.get("verdict") or r.get("runs") or r.get("blocks")}
+                    if r.get("verdict") or r.get("runs") or r.get("blocks")
+                    or r.get("vacuum") or (r.get("snaps") or [])}
     sid = (arg or "").strip()
     if sid:
         return json.dumps({"ok": True, "sessions": {sid: sessions.get(sid)}})
@@ -743,6 +977,74 @@ def _cmd_impact(arg: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# /day-instincts, /day-instinct-set, /day-instinct-del, /day-vacuum
+# ---------------------------------------------------------------------------
+
+
+def _cmd_instincts(arg: str = "") -> str:
+    """JSON map of every repo's instinct ledger (enabled + disabled)."""
+    repos = {}
+    for root in _instinct_roots():
+        items = _load_instincts(root)
+        if items:
+            repos[root] = items
+    return json.dumps({"ok": True, "repos": repos})
+
+
+def _cmd_instinct_set(arg: str = "") -> str:
+    """``<repo_root> <instinct_id> <0|1>`` — toggle an instinct on/off."""
+    parts = (arg or "").split()
+    if len(parts) < 3:
+        return json.dumps({"ok": False, "error": "usage: day-instinct-set <root> <id> <0|1>"})
+    root, iid, flag = parts[0], parts[1], parts[2] == "1"
+    items = _load_instincts(root)
+    item = next((i for i in items if i.get("id") == iid), None)
+    if not item:
+        return json.dumps({"ok": False, "error": f"instinct {iid} not found in {root}"})
+    item["enabled"] = flag
+    _INSTINCT_CACHE[root] = items
+    _save_instincts(root, items)
+    return json.dumps({"ok": True, "id": iid, "enabled": flag})
+
+
+def _cmd_instinct_del(arg: str = "") -> str:
+    """``<repo_root> <instinct_id>`` — delete an instinct."""
+    parts = (arg or "").split()
+    if len(parts) < 2:
+        return json.dumps({"ok": False, "error": "usage: day-instinct-del <root> <id>"})
+    root, iid = parts[0], parts[1]
+    items = _load_instincts(root)
+    kept = [i for i in items if i.get("id") != iid]
+    if len(kept) == len(items):
+        return json.dumps({"ok": False, "error": f"instinct {iid} not found in {root}"})
+    _INSTINCT_CACHE[root] = kept
+    _save_instincts(root, kept)
+    return json.dumps({"ok": True, "id": iid, "removed": True})
+
+
+def _cmd_vacuum(arg: str = "") -> str:
+    """``<session_key>`` — arm context vacuum for a session's tool dumps."""
+    sid = (arg or "").strip()
+    if not sid:
+        return json.dumps({"ok": False, "error": "usage: day-vacuum <session_key>"})
+    rec = _find_rec(sid)
+    _VACUUM_ARMED.add(sid)
+    # arm every key spelling too — hook sees the agent/session key
+    if rec is not None:
+        for k in _SESSIONS:
+            if _SESSIONS[k] is rec:
+                _VACUUM_ARMED.add(k)
+    with _LOCK:
+        if rec is not None:
+            vac = rec.setdefault("vacuum", {"armed": True, "trimmed": 0, "saved_chars": 0})
+            vac["armed"] = True
+            _persist()
+    return json.dumps({"ok": True, "session": sid, "armed": True,
+                       "note": f"tool dumps >{_VACUUM_MIN_LINES} lines now archive to disk "
+                               "and enter context as a compact placeholder"})
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -767,6 +1069,12 @@ def register(ctx: Any) -> None:
     ctx.register_hook("post_tool_call", _post_tool_call)
     ctx.register_hook("pre_verify", _pre_verify)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
+    ctx.register_hook("transform_tool_result", _transform_tool_result)
+    try:
+        ctx.register_system_prompt_section(
+            "hermes_day.instincts", _instincts_section, position="after_memory")
+    except Exception:
+        pass
     ctx.register_command(
         "day-evidence", _cmd_evidence,
         description="Evidence-gate verdicts as JSON (arg: optional session key).",
@@ -780,5 +1088,24 @@ def register(ctx: Any) -> None:
     ctx.register_command(
         "day-impact", _cmd_impact,
         description="Blast-radius scan: touched symbols, dependents, coverage.",
+        args_hint="<session_key>",
+    )
+    ctx.register_command(
+        "day-instincts", _cmd_instincts,
+        description="Repo negative-instinct ledgers as JSON.",
+    )
+    ctx.register_command(
+        "day-instinct-set", _cmd_instinct_set,
+        description="Toggle a repo instinct on/off.",
+        args_hint="<repo_root> <instinct_id> <0|1>",
+    )
+    ctx.register_command(
+        "day-instinct-del", _cmd_instinct_del,
+        description="Delete a repo instinct.",
+        args_hint="<repo_root> <instinct_id>",
+    )
+    ctx.register_command(
+        "day-vacuum", _cmd_vacuum,
+        description="Arm context vacuum: verbose tool dumps archive to disk.",
         args_hint="<session_key>",
     )

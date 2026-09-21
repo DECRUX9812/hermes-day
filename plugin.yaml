@@ -20,6 +20,7 @@ provides_tools: []
 provides_hooks:
   - pre_tool_call
   - post_tool_call
+  - transform_tool_result
   - pre_verify
   - on_session_finalize
 provides_middleware: []
