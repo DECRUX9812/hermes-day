@@ -1,1 +1,3 @@
 __pycache__/
+.hermes/
+.pytest_cache/

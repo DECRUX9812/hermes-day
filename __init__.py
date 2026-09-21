@@ -80,6 +80,7 @@ _MAX_SNAPS = 25
 _MAX_INSTINCTS = 60             # per repo ledger
 _MAX_VERIFY_NUDGES = 2          # self-throttle; framework caps at agent.max_verify_nudges
 _MAX_APPROVALS = 40              # per-session approval ledger
+_MAX_PENDING_APPROVALS = 60      # in-flight request/response correlation set
 _MAX_ATTN = 40                   # per-session attention ledger
 _ATTN_KINDS = ("interrupted", "provider_error", "subagent_failed", "approval_stall")
 _VACUUM_MIN_LINES = 40           # results longer than this get trimmed when armed
@@ -113,6 +114,54 @@ _CHECK_WORD = (
     r"ruff(?:\s+check)?|mypy|pyright|tsc|eslint|pylint|clippy|shellcheck|biome|staticcheck)"
 )
 _CHECK_RE = re.compile(r"\b" + _CHECK_WORD + r"\b")
+
+# Shell segments that set up the real command but are never the thing worth
+# retrying. Promoting them yields nonsense constraints like "NEVER cd".
+_NAV_SEGMENTS = {"cd", "pushd", "popd", "source", ".", "set", "export", "unset",
+                 "unsetenv", "true", ":", "echo", "printf", "sudo", "env",
+                 "command", "nohup", "nice", "time", "wait", "mkdir", "cp", "mv"}
+_SHELL_SPLIT_RE = re.compile(r"&&|\|\||;|\n|\|")
+_GENERIC_TRIGGER = "this command"   # neutral label; must not be a _NAV_SEGMENTS member
+
+
+def _trigger_of(cmd: str) -> str:
+    """Derive the retry-trigger for a command, not merely its first token.
+
+    ``cd repo && python -m pytest -q`` must yield ``python -m pytest`` — the
+    leading token of a compound command is almost always navigation or setup,
+    and promoting it produces useless "NEVER cd"-style constraints that then
+    get injected into future prompts.
+    """
+    text = str(cmd or "").strip()
+    if not text:
+        return _GENERIC_TRIGGER
+    for raw in _SHELL_SPLIT_RE.split(text):
+        seg = raw.strip()
+        while seg:
+            head, _, tail = seg.partition(" ")
+            # drop leading VAR=value assignments and wrapper verbs
+            if ("=" in head and not head.startswith("-")) or head in _NAV_SEGMENTS:
+                seg = tail.strip()
+                continue
+            break
+        if not seg or not _CHECK_RE.search(seg):
+            continue
+        head, _, tail = seg.partition(" ")
+        base = os.path.basename(head) or head
+        if base in _NAV_SEGMENTS:
+            continue
+        # `env FOO=1 python -m pytest` already unwrapped; keep module targets
+        rest = tail.split()
+        if len(rest) >= 2 and rest[0] == "-m":
+            return f"{base} -m {rest[1]}"[:80]
+        if rest and not rest[0].startswith("-") and "/" not in rest[0] \
+                and not rest[0].endswith((".py", ".js", ".ts", ".sh")):
+            return f"{base} {rest[0]}"[:80]
+        return base[:80]
+    # Nothing check-like was identifiable; keep the historical fallback, but
+    # never hand back a navigation token — that is the poison this guards.
+    fallback = text.split(" ", 1)[0][:80]
+    return _GENERIC_TRIGGER if fallback in _NAV_SEGMENTS else fallback
 
 # Path-shaped token inside a shell command that smells like a test file/dir.
 _TEST_TOKEN = r"[^\s\"'`;&|]*(?:test|spec|conftest|__tests__|_test)[^\s\"'`;&|]*"
@@ -617,8 +666,7 @@ def _post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
             # non-zero exits become negative instincts for the repo — but only
             # for check/build-ish commands a future turn might blindly retry
             if code not in (None, 0) and _CHECK_RE.search(cmd):
-                _promote_instinct(rec, None,
-                                  cmd.strip().split(" ", 1)[0][:80],
+                _promote_instinct(rec, None, _trigger_of(cmd),
                                   cmd[:240], f"exited {code}")
             _persist()
     except Exception:
@@ -1135,7 +1183,7 @@ def _pre_approval_request(command: str = "", description: str = "",
             rec = _rec(session_id or session_key or "")
             _append(rec["approvals"], entry, _MAX_APPROVALS)
             _PENDING_APPROVALS.append(entry)
-            del _PENDING_APPROVALS[:-80]      # bound in-flight correlation set
+            del _PENDING_APPROVALS[:-_MAX_PENDING_APPROVALS]  # bound in-flight set
             rec["at"] = entry["ts"]
         _persist()
     except Exception:
