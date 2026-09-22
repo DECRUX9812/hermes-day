@@ -83,6 +83,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -110,6 +111,42 @@ _LOCK = threading.RLock()
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
 _VACUUM_ARMED: set = set()      # session_ids with context vacuum armed
 _INSTINCT_CACHE: Dict[str, list] = {}  # repo_root -> instincts (enabled ones first)
+_GATE_LEDGER: list = []         # hday_gate.decide shadow rows, newest last
+_MAX_GATE_LEDGER = 400
+_SECTION_STATE_KEY = "section_toggles"   # ctx.state key: {section: bool}
+_HDAY_MODS: Dict[str, Any] = {}  # name -> module | None (lazy path imports)
+
+
+def _hday(name: str) -> Optional[Any]:
+    """Lazy-load a sibling ``hday_*`` module by path — no sys.path assumption.
+
+    The standalone mandate modules live next to this file; loading them by
+    ``__file__`` keeps the worktree/live copies isolated the same way the
+    patches loader is. A missing/broken module caches ``None`` and the caller
+    degrades to "that telemetry is absent", never a wedge on the hot path.
+    """
+    if name in _HDAY_MODS:
+        return _HDAY_MODS[name]
+    mod = None
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            f"{name}.py")
+        # Reuse an already-imported module only when it is THIS file — a
+        # same-named module from another install would split the ledger.
+        existing = sys.modules.get(name)
+        if existing is not None and os.path.abspath(
+                getattr(existing, "__file__", "") or "") == path:
+            mod = existing
+        else:
+            import importlib.util as ilu
+            spec = ilu.spec_from_file_location(name, path)
+            if spec is not None and spec.loader is not None:
+                mod = ilu.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+    except Exception:
+        mod = None
+    _HDAY_MODS[name] = mod
+    return mod
 
 # ---------------------------------------------------------------------------
 # Detection tables
@@ -466,6 +503,31 @@ def _vacuum_dir(sid: str) -> str:
 _DUMP_FIELDS = ("stdout", "stderr", "output", "result", "text", "log")
 
 
+def _ctxscore_observe(session_id: str, text: str) -> None:
+    """Score a vacuumed dump's chunks for the decision ledger — observe-only.
+
+    No judge is wired yet, so rows land ``unjudged`` (reason ``no-judge``):
+    the cockpit still sees that a scoring pass ran and what it would have
+    discriminated. Never raises; never changes the tool result.
+    """
+    try:
+        cs = _hday("hday_ctxscore")
+        if cs is None:
+            return
+        ts = time.time()
+
+        def _stamp(row: Dict[str, Any]) -> None:
+            try:
+                row["sid"] = session_id
+                row["ts"] = ts
+            except Exception:
+                pass
+
+        cs.score(text, "", judge=None, ledger=_stamp)
+    except Exception:
+        return
+
+
 def _transform_tool_result(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
                            result: Any = None, session_id: str = "",
                            **_kw: Any) -> Optional[str]:
@@ -515,6 +577,7 @@ def _transform_tool_result(tool_name: str = "", args: Optional[Dict[str, Any]] =
             vac["trimmed"] += 1
             vac["saved_chars"] += max(0, len(body) - len(trimmed))
             _persist()
+        _ctxscore_observe(session_id, body)
         return out
     except Exception:
         return None
@@ -680,6 +743,34 @@ def _canary(force: bool = False) -> Dict[str, Any]:
     return _CANARY
 
 
+def _gate_observe(tool_name: str, args: Dict[str, Any], session_id: str) -> None:
+    """Shadow the typed gate on every call — observe-only, never enforces.
+
+    The inline deny-list above stays the enforcement path; hday_gate.decide
+    runs beside it so the cockpit's decision ledger shows real rows as the
+    gate fires — ``regex_hit`` on deny-listed calls, ``unjudged`` otherwise
+    until a typed judge is wired. decide() is fail-open and cheap (regex
+    phase is pure Python); any failure here must not wedge the tool loop.
+    """
+    try:
+        gate = _hday("hday_gate")
+        if gate is None:
+            return
+        ctx = dict(args)
+        ctx["args"] = args
+        decision = gate.decide(tool_name, "", ctx, judge=None)
+        row = dict(decision.get("row") or {})
+        row["allow"] = bool(decision.get("allow"))
+        row["reason"] = str(decision.get("reason") or "")[:240]
+        row["sid"] = session_id
+        row["tool"] = tool_name
+        row["ts"] = time.time()
+        with _LOCK:
+            _append(_GATE_LEDGER, row, _MAX_GATE_LEDGER)
+    except Exception:
+        return
+
+
 def _pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
                    session_id: str = "", **_kw: Any) -> Optional[Dict[str, str]]:
     try:
@@ -687,6 +778,7 @@ def _pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
             return None
         _canary()  # TTL-cached liveness probe for the gate itself
         args = args if isinstance(args, dict) else {}
+        _gate_observe(tool_name, args, session_id)
         hit = None
         if tool_name == "terminal":
             cmd = str(args.get("command") or args.get("code") or "")
@@ -1281,6 +1373,102 @@ def _cmd_vacuum(arg: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Decision ledger + prompt-section toggles (Phase 6 cockpit observability)
+# ---------------------------------------------------------------------------
+
+_LEDGER_CAP = 200
+_TOGGLEABLE_SECTIONS = ("instincts", "gotchas")
+
+
+def _cmd_ledger(arg: str = "") -> str:
+    """``[session_key]`` — the typed control plane's decision ledger.
+
+    ``gate`` rows come from the hday_gate.decide shadow in _pre_tool_call;
+    ``ctxscore`` rows are hday_ctxscore's module ledger. Row shapes are the
+    modules' own (kind|status, lane, ms, cost); the cockpit's view-model owns
+    the display columns and the honest 'unknown' state for missing fields.
+    """
+    sid = (arg or "").strip()
+
+    def _scoped(rows):
+        return [r for r in rows if not sid or sid in str(r.get("sid") or "")]
+
+    with _LOCK:
+        gate = [dict(r) for r in _GATE_LEDGER]
+    ctx_rows = []
+    cs = _hday("hday_ctxscore")
+    if cs is not None:
+        try:
+            ctx_rows = [dict(r) for r in getattr(cs, "LEDGER", None) or []]
+        except Exception:
+            ctx_rows = []
+    return json.dumps({"ok": True,
+                       "gate": _scoped(gate)[-_LEDGER_CAP:],
+                       "ctxscore": _scoped(ctx_rows)[-_LEDGER_CAP:]})
+
+
+def _section_states() -> Dict[str, Dict[str, Any]]:
+    """{name: {enabled, source}} — source is config pin | cockpit toggle | default."""
+    cfg: Dict[str, Any] = {}
+    toggles: Dict[str, Any] = {}
+    if _CTX is not None:
+        try:
+            raw = _CTX.get_config("gate")
+            if isinstance(raw, dict):
+                cfg = raw
+        except Exception:
+            pass
+        try:
+            raw = _CTX.state.get(_SECTION_STATE_KEY)
+            if isinstance(raw, dict):
+                toggles = raw
+        except Exception:
+            pass
+    out = {}
+    for name in _TOGGLEABLE_SECTIONS:
+        if name in cfg:
+            out[name] = {"enabled": bool(cfg[name]), "source": "config"}
+        elif name in toggles:
+            out[name] = {"enabled": bool(toggles[name]), "source": "toggle"}
+        else:
+            out[name] = {"enabled": True, "source": "default"}
+    return out
+
+
+def _cmd_sections(arg: str = "") -> str:
+    """Prompt sections the cockpit can toggle, with their effective state."""
+    return json.dumps({"ok": True, "sections": _section_states()})
+
+
+def _cmd_section_set(arg: str = "") -> str:
+    """``<section> <0|1>`` — toggle a prompt section; next session's prompt changes."""
+    parts = (arg or "").split()
+    if len(parts) < 2:
+        return json.dumps({"ok": False,
+                           "error": "usage: day-section-set <name> <0|1>"})
+    name, flag = parts[0], parts[1].lower() in ("1", "on", "true", "yes")
+    if name not in _TOGGLEABLE_SECTIONS:
+        return json.dumps({"ok": False, "error": f"unknown section {name!r}",
+                           "sections": list(_TOGGLEABLE_SECTIONS)})
+    states = _section_states()
+    if states.get(name, {}).get("source") == "config":
+        return json.dumps({"ok": False,
+                           "error": f"{name} is pinned in config (gate.{name}) "
+                                    "— edit config.yaml to change it"})
+    if _CTX is None:
+        return json.dumps({"ok": False, "error": "no plugin context"})
+    try:
+        toggles = dict(_CTX.state.get(_SECTION_STATE_KEY) or {})
+        toggles[name] = flag
+        _CTX.state.set(_SECTION_STATE_KEY, toggles)
+    except Exception as exc:
+        return json.dumps({"ok": False,
+                           "error": f"state write failed: {exc}"})
+    return json.dumps({"ok": True, "section": name, "enabled": flag,
+                       "note": "takes effect on the next session's prompt"})
+
+
+# ---------------------------------------------------------------------------
 # Approval lifecycle, attention ledger, mid-session instincts (observer hooks)
 #
 # ``pre_approval_request`` / ``post_approval_response`` are observer-only (they
@@ -1705,6 +1893,12 @@ def _cmd_guard(arg: str = "") -> str:
 
 
 def _enabled(section: str) -> bool:
+    """Section/feature gate: config pin wins, then the cockpit toggle, else on.
+
+    ``gate.<section>`` in config.yaml is the admin pin — a cockpit toggle can
+    never override it. When config is silent, the durable ``section_toggles``
+    state (written by ``day-section-set``) decides; both absent = enabled.
+    """
     if _CTX is None:
         return True
     try:
@@ -1713,7 +1907,46 @@ def _enabled(section: str) -> bool:
             return bool(cfg[section])
     except Exception:
         pass
+    try:
+        toggles = _CTX.state.get(_SECTION_STATE_KEY) or {}
+        if section in toggles:
+            return bool(toggles[section])
+    except Exception:
+        pass
     return True
+
+
+def _gotchas_section(session_info: Dict[str, Any]) -> str:
+    """Standing repo context: ``**/GOTCHAS.md`` for dirs this session touches.
+
+    Rendered once per session and frozen into the prompt (same discipline as
+    the instincts section): paths in context at render time are the cwd plus
+    any files a resumed session already touched, so a repo-root GOTCHAS.md
+    always applies and nested ones join once their dirs are in play.
+    """
+    try:
+        if not _enabled("gotchas"):
+            return ""
+        gotchas = _hday("hday_gotchas")
+        if gotchas is None:
+            return ""
+        info = session_info or {}
+        cwd = str(info.get("cwd") or "")
+        root = _repo_root(cwd) or (cwd if cwd and os.path.isdir(cwd) else "")
+        if not root:
+            return ""
+        discovered = gotchas.discover(root)
+        if not discovered:
+            return ""
+        paths = [cwd]
+        sid = str(info.get("session_id") or "")
+        if sid:
+            rec = _find_rec(sid)
+            if rec is not None:
+                paths.extend(rec.get("files") or [])
+        return gotchas.build_section(gotchas.sections_for(paths, discovered)) or ""
+    except Exception:
+        return ""
 
 
 def register(ctx: Any) -> None:
@@ -1742,6 +1975,11 @@ def register(ctx: Any) -> None:
     try:
         ctx.register_system_prompt_section(
             "hermes_day.instincts", _instincts_section, position="after_memory")
+    except Exception:
+        pass
+    try:
+        ctx.register_system_prompt_section(
+            "hermes_day.gotchas", _gotchas_section, position="after_memory")
     except Exception:
         pass
     ctx.register_command(
@@ -1791,6 +2029,20 @@ def register(ctx: Any) -> None:
         "day-guard", _cmd_guard,
         description="Honesty-guard self-test: proves the gate blocks and is not over-blocking.",
         args_hint="[force]",
+    )
+    ctx.register_command(
+        "day-ledger", _cmd_ledger,
+        description="Decision ledger: gate + ctxscore rows (lane, status, cost, ms).",
+        args_hint="[session_key]",
+    )
+    ctx.register_command(
+        "day-sections", _cmd_sections,
+        description="Prompt sections the cockpit can toggle, with effective state.",
+    )
+    ctx.register_command(
+        "day-section-set", _cmd_section_set,
+        description="Toggle a prompt section on/off (next session's prompt).",
+        args_hint="<section> <0|1>",
     )
 
     # Feature lanes: one file each under patches/, loaded by path so no import
