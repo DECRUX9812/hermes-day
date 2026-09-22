@@ -26,6 +26,7 @@ provides_hooks:
   - pre_approval_request
   - post_approval_response
   - agent_loop_stopped
+  - subagent_start
   - subagent_stop
   - api_request_error
   - pre_llm_call
