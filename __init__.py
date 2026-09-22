@@ -1767,3 +1767,20 @@ def register(ctx: Any) -> None:
         description="Honesty-guard self-test: proves the gate blocks and is not over-blocking.",
         args_hint="[force]",
     )
+
+    # Feature lanes: one file each under patches/, loaded by path so no import
+    # path assumption is needed. This is the extension seam that lets parallel
+    # builders add commands without ever touching this monolith — 4 lanes
+    # independently targeted this exact block, which is how parallel builds
+    # corrupt a file. Per-module failures are isolated so one broken lane
+    # degrades to "that feature is missing", never "the cockpit is dead".
+    global PATCH_RESULTS
+    try:
+        import importlib.util as _ilu
+        _patches_init = __file__.replace("__init__.py", "patches/__init__.py")
+        _spec = _ilu.spec_from_file_location("hday_patches_pkg", _patches_init)
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        PATCH_RESULTS = _mod.register_all(ctx)
+    except Exception:
+        PATCH_RESULTS = {}
