@@ -122,6 +122,8 @@ const $undo = atom(null)
 // evidence gate verdicts from the agent half (pre_tool_call/post_tool_call/
 // pre_verify); key: `${sourceKey}#${session_key}`, value: {verdict, detail, ...}
 const $evidence = atom({})
+// honesty-guard liveness reported by the agent half: {ok, degraded, failed[], cases[]}
+const $guard = atom({})
 /** sessionKey -> recent latest_seq samples — the in-flight heartbeat */
 const seqHist = new Map()
 const SPARK_LEN = 14
@@ -188,7 +190,22 @@ function ensureDayStyles() {
     'body:has(.hday-root) div[class*="over-modal"] [class*="bg-popover"]{'
       + 'background:#161922!important;color:#f3f4f6!important;border-color:#262a33!important;'
       + 'backdrop-filter:none!important;box-shadow:0 8px 28px rgba(0,0,0,.55)!important}' +
-    'body:has(.hday-root) div[class*="over-modal"] [class*="text-muted-foreground"]{color:#94a3b8!important}'
+    'body:has(.hday-root) div[class*="over-modal"] [class*="text-muted-foreground"]{color:#94a3b8!important}' +
+    // guard shield — the gate's own liveness, never silent
+    '@keyframes hday-pulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}50%{box-shadow:0 0 0 3px rgba(239,68,68,.35)}}' +
+    '.hday-shield{display:inline-flex;align-items:center;gap:.3rem;border:1px solid;border-radius:999px;' +
+      'padding:.1rem .45rem;font-size:.6rem;font-weight:600;letter-spacing:.03em;text-transform:uppercase}' +
+    '.hday-shield.hday-degraded{animation:hday-pulse 1.6s ease-in-out infinite}' +
+    // tamper hatch — a verdict that was bought rather than earned
+    '.hday-hatch{background-image:repeating-linear-gradient(45deg,rgba(239,68,68,.13) 0 6px,transparent 6px 12px)}' +
+    // attention rows carry a left stripe in their kind's colour
+    '.hday-attn{border-left:2px solid transparent}' +
+    '.hday-attn:hover{background:#171a22}' +
+    // receipt — evidence rendered like a till slip
+    '.hday-receipt{border:1px dashed currentColor;border-radius:4px;padding:.5rem .6rem;' +
+      'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.66rem;line-height:1.55}' +
+    '.hday-receipt-row{display:flex;gap:.5rem;justify-content:space-between}' +
+    '.hday-receipt-sep{border-top:1px dashed currentColor;opacity:.35;margin:.35rem 0}'
   document.head.appendChild(el)
 }
 
@@ -329,11 +346,14 @@ async function scanRoute(route) {
     const disp = await rpc(route, 'command.dispatch', { name: 'day-evidence', arg: '' })
     const out = disp && (disp.output || disp.text || '')
     const parsed = out && out.trim().startsWith('{') ? JSON.parse(out) : null
+    if (parsed && parsed.guard && typeof parsed.guard === 'object') $guard.set(parsed.guard)
     const sessions = parsed && parsed.sessions
     if (sessions && typeof sessions === 'object') {
       const ev = { ...$evidence.get() }
       for (const [k, v] of Object.entries(sessions)) {
-        if (v && (v.verdict || v.runs || v.blocks || v.vacuum || (v.snaps && v.snaps.length))) ev[`${source.key}#${k}`] = v
+        if (v && (v.verdict || v.runs || v.blocks || v.vacuum || (v.snaps && v.snaps.length)
+                  || (v.approvals && v.approvals.length) || (v.attn && v.attn.length)
+                  || (v.tamper && v.tamper.length))) ev[`${source.key}#${k}`] = v
       }
       $evidence.set(ev)
     }
@@ -2378,6 +2398,23 @@ function EvidenceView({ ev }) {
         className: 'flex items-center gap-2',
         children: [jsx(EvidenceBadge, { ev }), jsx('span', { className: 'text-[0.72rem]', style: { color: C.muted }, children: ev.detail || '' })]
       }),
+      jsx(ReceiptCard, { receipt: ev.receipt, tamper: ev.tamper }),
+      ev.tamper && ev.tamper.length
+        ? jsxs('div', {
+            children: [
+              jsx('div', {
+                className: 'mb-1 text-[0.62rem] font-semibold uppercase tracking-wider',
+                style: { color: C.red },
+                children: 'Suite integrity'
+              }),
+              jsx('div', {
+                className: 'flex flex-col gap-0.5',
+                children: ev.tamper.map((t, i) =>
+                  jsx('div', { className: 'font-mono text-[0.64rem]', style: { color: C.red }, children: t }, i))
+              })
+            ]
+          })
+        : null,
       ev.run_list && ev.run_list.length
         ? jsxs('div', {
             children: [
@@ -2801,6 +2838,140 @@ function Inspector({ e, evMap }) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Guard shield — the honesty gate's own liveness, surfaced rather than assumed
+// ---------------------------------------------------------------------------
+
+function guardState(g) {
+  if (!g || Object.keys(g).length === 0) return 'unknown'
+  return g.degraded ? 'degraded' : 'ok'
+}
+
+function GuardShield() {
+  const g = useValue($guard)
+  const state = guardState(g)
+  const tone = state === 'degraded' ? C.red : state === 'ok' ? C.emerald : C.slate
+  const failed = Array.isArray(g && g.failed) ? g.failed : []
+  const cases = Array.isArray(g && g.cases) ? g.cases : []
+  const label = state === 'degraded' ? 'guard degraded' : state === 'ok' ? 'guard live' : 'guard unproven'
+  const tip = state === 'degraded'
+    ? `Honesty guard self-test is failing: ${failed.join(', ') || 'unknown case'}. Blocked-action protection cannot be trusted until this is fixed.`
+    : state === 'ok'
+      ? `Guard self-test passing (${cases.length} cases). Blocks test deletion, assertion gutting and exit laundering; deliberately allows cache cleanup.`
+      : 'Guard has not reported yet this session.'
+  return jsx(Tip, {
+    label: tip,
+    children: jsxs('span', {
+      className: `hday-shield${state === 'degraded' ? ' hday-degraded' : ''}`,
+      style: { color: tone, borderColor: tone },
+      children: [jsx(Codicon, { name: 'shield', size: 11 }), label]
+    })
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Attention strip — what went wrong while you were not looking
+// ---------------------------------------------------------------------------
+
+const ATTN_STYLE = {
+  interrupted: { icon: 'debug-stop', tone: () => C.amber },
+  provider_error: { icon: 'cloud-offline', tone: () => C.red },
+  subagent_failed: { icon: 'error', tone: () => C.red },
+  approval_stall: { icon: 'watch', tone: () => C.amber },
+  secret_exposure: { icon: 'key', tone: () => C.red },
+  test_tamper: { icon: 'beaker', tone: () => C.red }
+}
+
+function AttentionRow({ item }) {
+  const cfg = ATTN_STYLE[item.kind] || { icon: 'info', tone: () => C.slate }
+  const tone = cfg.tone()
+  return jsxs('div', {
+    className: 'hday-attn flex items-start gap-2 px-2 py-1',
+    style: { borderLeftColor: tone },
+    children: [
+      jsx(Codicon, { name: cfg.icon, size: 11, style: { color: tone, marginTop: '2px' } }),
+      jsxs('div', {
+        className: 'min-w-0 flex-1',
+        children: [
+          jsx('div', { className: 'truncate text-[0.68rem]', style: { color: C.text }, children: item.text || item.kind }),
+          jsx('div', { className: 'text-[0.58rem]', style: { color: C.faint }, children: item.ts ? relativeTime(item.ts * 1000) : '' })
+        ]
+      })
+    ]
+  })
+}
+
+function AttentionStrip() {
+  const evMap = useValue($evidence)
+  const items = useMemo(() => {
+    const all = []
+    for (const [key, rec] of Object.entries(evMap || {})) {
+      for (const it of (rec && rec.attn) || []) all.push({ ...it, key })
+    }
+    return all.sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, 4)
+  }, [evMap])
+  if (!items.length) return null
+  return jsxs('div', {
+    className: 'mb-2 overflow-hidden rounded border',
+    style: { borderColor: C.border, background: C.surface },
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-1.5 px-2 py-1 text-[0.6rem] font-semibold uppercase tracking-wider',
+        style: { color: C.amber },
+        children: [jsx(Codicon, { name: 'alert', size: 10 }), `Attention · ${items.length}`]
+      }),
+      ...items.map((it, i) => jsx(AttentionRow, { item: it }, i))
+    ]
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Receipt — a verdict printed like a till slip
+// ---------------------------------------------------------------------------
+
+function ReceiptCard({ receipt, tamper }) {
+  if (!receipt || !receipt.verdict) return null
+  const flagged = receipt.verdict === 'flagged'
+  const tone = flagged ? C.red : receipt.verdict === 'verified' ? C.emerald : C.amber
+  const rows = [
+    ['verdict', receipt.verdict],
+    ['command', receipt.cmd ? String(receipt.cmd).slice(0, 46) : '—'],
+    ['exit', receipt.exit === null || receipt.exit === undefined ? '—' : String(receipt.exit)],
+    ['tree', receipt.tree ? String(receipt.tree).slice(0, 10) : '—'],
+    ['checks run', String(receipt.runs == null ? 0 : receipt.runs)],
+    ['guard blocks', String(receipt.blocks == null ? 0 : receipt.blocks)],
+    ['suite damage', String(receipt.tamper == null ? 0 : receipt.tamper)]
+  ]
+  return jsxs('div', {
+    className: `hday-receipt${flagged ? ' hday-hatch' : ''}`,
+    style: { color: tone },
+    children: [
+      jsx('div', { className: 'mb-1 text-center font-semibold uppercase tracking-widest', children: 'evidence receipt' }),
+      jsx('div', { className: 'hday-receipt-sep' }),
+      ...rows.map(([k, v], i) => jsxs('div', {
+        className: 'hday-receipt-row',
+        children: [
+          jsx('span', { style: { opacity: 0.7 }, children: k }),
+          jsx('span', { className: 'truncate text-right', children: v })
+        ]
+      }, i)),
+      jsx('div', { className: 'hday-receipt-sep' }),
+      jsx('div', {
+        className: 'text-center text-[0.6rem]',
+        style: { opacity: 0.8 },
+        children: receipt.ts ? new Date(receipt.ts * 1000).toLocaleString() : ''
+      }),
+      tamper && tamper.length
+        ? jsx('div', {
+            className: 'mt-1 text-center text-[0.6rem]',
+            style: { color: C.red },
+            children: tamper[0]
+          })
+        : null
+    ]
+  })
+}
+
 function DayPage() {
   ensureDayStyles()
   const scan = useQuery({ queryKey: SCAN_QK, queryFn: scanInbox, refetchInterval: 5000, staleTime: 1500, refetchOnWindowFocus: true })
@@ -3044,6 +3215,18 @@ function DayPage() {
                       jsx(StatTile, { icon: 'calendar', label: 'Scheduled', n: jobs.length, color: '#a855f7', scrollTo: 'hday-sched' })
                     ]
                   }),
+                  jsxs('div', {
+                    className: 'mb-1.5 flex items-center gap-2',
+                    children: [
+                      jsx(GuardShield, {}),
+                      jsx('span', {
+                        className: 'text-[0.58rem] uppercase tracking-wider',
+                        style: { color: C.faint },
+                        children: 'honesty gate'
+                      })
+                    ]
+                  }),
+                  jsx(AttentionStrip, {}),
                   jsx(QuickTaskBar, {}),
                   jsxs('div', {
                     className: 'mt-2 flex items-center gap-3 px-1 pb-1',
