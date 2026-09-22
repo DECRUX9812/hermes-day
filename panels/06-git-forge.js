@@ -409,6 +409,9 @@ function hdayPanel06(props) {
                     line: line });
       rescan();
       return env;
+    }).catch(function (e) {
+      A.busy.set(null);
+      A.strip.set({ kind: 'err', line: String(e && e.message ? e.message : e) });
     });
   }
 
@@ -428,10 +431,8 @@ function hdayPanel06(props) {
       act(rArg, 'review posted');
       return;
     }
-    if (tab === 'release') {
-      var t = tagValue || (data.release && data.release.next_tag) || 'v0.1.1';
-      act('release ' + t, 'tagged');
-    }
+    // Release has no Enter binding in spec §3.3: it fires only from its
+    // three labelled buttons (a click is the confirmation, like approve's 2nd step).
   }
 
   function fireArmed() {
@@ -529,7 +530,7 @@ function hdayPanel06(props) {
       onTag: function (v) { A.tag.set(v); },
       onRelease: function (m) {
         var t = tagValue || (data.release && data.release.next_tag) || 'v0.1.1';
-        var arg = 'release ' + t + (m === 'gh' ? ' gh ' + t : m === 'local' ? ' local' : '');
+        var arg = 'release ' + t + (m === 'gh' ? ' gh' : m === 'local' ? ' local' : '');
         act(arg, m === 'local' ? 'tagged' : 'tagged & pushed');
       },
       key: 'release'
@@ -589,7 +590,8 @@ function hdayPanel06(props) {
       composer,
       stripView,
       jsx('div', { className: 'hday-row', style: { color: C.faint, fontSize: '0.62rem' },
-                   children: busy ? ('running: ' + busy)
+                   children: busy
+                     ? jsx('span', { children: [spinIcon('sync'), ' running: ' + busy] })
                      : 'keys: ↑/↓ select · c comment · r review · a approve (Enter fires) · d diff · t release · Esc closes' }),
       jsx('div', { style: { color: C.faint, fontSize: '0.6rem' },
                    children: 'generated ' + hdayForgeStamp(data.generated_at) })

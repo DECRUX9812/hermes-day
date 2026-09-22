@@ -506,7 +506,7 @@ function hdayPanel08Ledger(props) {
                           off ? jsx(Badge, { size: 'xs', variant: 'muted', children: 'OFF' }) : null,
                           isShadow
                             ? jsx(Tip, {
-                                label: 'In the ledger, not in the prompt — beyond items[:8] or past lines[:16] (repo headers count).',
+                                label: 'In the ledger, not in the prompt — beyond items[:8], past lines[:16] (repo headers count), or the whole section is currently disabled.',
                                 children: jsx(Badge, { size: 'xs', variant: 'warn', children: 'SHADOWED' })
                               })
                             : null,
@@ -637,12 +637,13 @@ function hdayPanel08Preview(props) {
             children: 'SECTION MARKERS PRESENT — dispatch skips it (reserved persistence marker).'
           })
         : null,
-      !over && !markers && chars === 0 && !loading
+      !over && !markers && chars === 0 && !loading && !error
         ? jsx('div', {
             className: 'text-[0.6rem]',
-            style: { color: enabledInScope ? C.amber : C.faint },
-            children: enabledInScope
+            style: { color: view && view.data && view.data.gate === false ? C.faint : C.amber },
+            children: (view && view.data && view.data.gate === false)
               ? 'SECTION DISABLED (gate.instincts) — nothing is injected while the gate is off.'
+              : enabledInScope ? 'Empty block — preview did not render (see the error above).'
               : 'No enabled instincts — nothing to inject.'
           })
         : null,
@@ -775,6 +776,10 @@ function hdayPanel08(props) {
     frozen = statusQ.data.sessions.filter(function (s) { return Number(s.inst_epoch) > 0 }).length
   }
 
+  // A backend refusal (ok:false) must surface, not fall through to the other
+  // view: a failed STAGED render never silently falls back to SAVED bytes.
+  var backendErr = (stagedQ.data && stagedQ.data.ok === false) ? stagedQ.data.error
+    : (liveQ.data && liveQ.data.ok === false) ? liveQ.data.error : null
   var shadowed = []
   var view = null
   var viewLoading = liveQ.isLoading
@@ -786,11 +791,10 @@ function hdayPanel08(props) {
       stale: Boolean(editing && staged && staged.value !== hdayPanel08Brief(editing.draft))
     }
     viewLoading = stagedQ.isLoading
-    viewError = stagedQ.data && stagedQ.data.ok === false ? stagedQ.data.error : null
   } else if (liveQ.data && liveQ.data.ok !== false) {
     view = { mode: 'SAVED', data: liveQ.data, stale: false }
-    viewError = liveQ.data && liveQ.data.ok === false ? liveQ.data.error : null
   }
+  viewError = viewError || backendErr
   if (view && view.data) shadowed = view.data.shadowed || []
 
   function setFailedKey(key, bad) {

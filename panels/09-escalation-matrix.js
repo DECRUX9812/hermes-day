@@ -214,7 +214,29 @@ function hday09Reset(route, refetch) {
 
 function hday09Data(query) {
   try {
-    var raw = (query && query.data) || {};
+    // A rejected/non-JSON fetch or a backend failure yields null / ok:false —
+    // that is an UNAVAILABLE probe, never a measured zero (gate 4).
+    var raw = (query && query.data) || null;
+    var noData = !raw || raw.ok === false;
+    if (noData) {
+      var emptyCounts = {};
+      hday09Kinds().forEach(function (kind) { emptyCounts[kind] = 0; });
+      return {
+        matrix: hday09DefaultMatrix(),
+        rows: [],
+        open: [],
+        counts: emptyCounts,
+        otherRows: [],
+        otherCount: 0,
+        unknownKinds: [],
+        total: null,
+        unacked: null,
+        quiet: null,
+        samples: [],
+        lastFetch: null,
+        noData: true
+      };
+    }
     var kinds = hday09Kinds();
     var defaults = hday09DefaultMatrix();
     var stored = raw.matrix || {};
@@ -252,6 +274,10 @@ function hday09Data(query) {
       return kinds.indexOf(kind) < 0;
     });
     var debt = raw.debt || {};
+    var total = (debt.total !== undefined && debt.total !== null &&
+                 isFinite(Number(debt.total))) ? Number(debt.total) : null;
+    var unacked = (debt.unacked !== undefined && debt.unacked !== null &&
+                   isFinite(Number(debt.unacked))) ? Number(debt.unacked) : null;
     return {
       matrix: matrix,
       rows: rows,
@@ -260,26 +286,30 @@ function hday09Data(query) {
       otherRows: otherRows,
       otherCount: otherCount,
       unknownKinds: unknownKinds,
-      total: Number(debt.total) || 0,
-      unacked: Number(debt.unacked) || 0,
+      total: total,
+      unacked: unacked,
       quiet: raw.quiet || null,
-      samples: raw.ms_samples || [],
-      lastFetch: raw.generated_at || null
+      samples: Array.isArray(raw.ms_samples) ? raw.ms_samples : [],
+      lastFetch: raw.generated_at || null,
+      noData: false
     };
   } catch (e) {
+    var catchCounts = {};
+    hday09Kinds().forEach(function (kind) { catchCounts[kind] = 0; });
     return {
       matrix: hday09DefaultMatrix(),
       rows: [],
       open: [],
-      counts: {},
+      counts: catchCounts,
       otherRows: [],
       otherCount: 0,
       unknownKinds: [],
-      total: 0,
-      unacked: 0,
+      total: null,
+      unacked: null,
       quiet: null,
       samples: [],
-      lastFetch: null
+      lastFetch: null,
+      noData: true
     };
   }
 }
@@ -290,7 +320,12 @@ function hday09ExpandAtom() {
     try {
       hday09ExpandAtom._atom = atom({});
     } catch (e) {
-      hday09ExpandAtom._atom = null;
+      // Non-null fallback so useValue is called exactly once every render
+      // (rules of hooks) — a no-op store instead of `null`.
+      hday09ExpandAtom._atom = {
+        get: function () { return {}; },
+        set: function () {}
+      };
     }
   }
   return hday09ExpandAtom._atom;
@@ -382,7 +417,7 @@ function hday09KindRow(props) {
       hday09CycleCell({
         label: hday09CoalesceText(entry.coalesce_s),
         color: C.text,
-        title: 'Click to cycle coalesce window: 30s → 1m → 5m → 10m → never',
+        title: 'Click to cycle coalesce window: 30s → 1m → 5m → 10m → never (notify absorption always keeps a 60s floor)',
         onClick: function () {
           props.onSet(kind, 'coalesce', String(nextCoalesce));
         }
@@ -590,24 +625,27 @@ function hdayPanel09(props) {
     queryFn: function () {
       try {
         var pending = rpc(route, 'command.dispatch', { name: 'day-matrix', arg: 'json' });
+        // failure branches: a rejected RPC or non-JSON output is an
+        // UNAVAILABLE probe — null, so the panel shows 'debt —' instead of
+        // an invented healthy zero (gate 4).
         var parse = function (disp) {
           try {
             var out = disp && (disp.output || disp.text || '');
             return out && String(out).trim().charAt(0) === '{'
               ? JSON.parse(out)
-              : { matrix: {}, rows: [], debt: {}, quiet: null };
+              : null;
           } catch (e) {
-            return { matrix: {}, rows: [], debt: {}, quiet: null };
+            return null;
           }
         };
         if (pending && typeof pending.then === 'function') {
           return pending.then(parse, function () {
-            return { matrix: {}, rows: [], debt: {}, quiet: null };
+            return null;
           });
         }
         return parse(pending);
       } catch (e) {
-        return { matrix: {}, rows: [], debt: {}, quiet: null };
+        return null;
       }
     },
     staleTime: 4000,
@@ -617,7 +655,7 @@ function hdayPanel09(props) {
   });
 
   var expandAtom = hday09ExpandAtom();
-  var expanded = (expandAtom && useValue(expandAtom)) || {};
+  var expanded = useValue(expandAtom) || {};
 
   var data = hday09Data(query);
   var kinds = hday09Kinds();
@@ -637,7 +675,10 @@ function hdayPanel09(props) {
 
   var quiet = data.quiet || {};
   var quietLabel = hday09Clock(quiet.start, '22:00') + '–' + hday09Clock(quiet.end, '07:00');
-  var debtColor = data.total > 0 ? C.amber : C.emerald;
+  // null debt = probe unavailable → neutral, never a healthy emerald zero.
+  var debtColor = data.total === null
+    ? C.muted
+    : (data.total > 0 ? C.amber : C.emerald);
 
   return jsx('div', {
     className: cn('hday-panel hday-matrix', props.className),
@@ -681,13 +722,13 @@ function hdayPanel09(props) {
                 jsx('span', {
                   className: 'text-[0.72rem] tabular-nums',
                   style: { color: debtColor, fontWeight: 700 },
-                  children: 'debt ' + data.total.toFixed(1)
+                  children: data.total === null ? 'debt —' : 'debt ' + data.total.toFixed(1)
                 }),
                 jsx(Codicon, { name: 'chevron-right', size: 12, style: { color: debtColor } }),
                 jsx('span', {
                   className: 'text-[0.58rem] tabular-nums',
                   style: { color: C.faint },
-                  children: data.unacked + ' unacked'
+                  children: (data.unacked === null ? '—' : String(data.unacked)) + ' unacked'
                 }),
                 jsx(Button, {
                   size: 'sm',
@@ -747,8 +788,8 @@ function hdayPanel09(props) {
                   style: { color: C.faint },
                   children: 'open attention (coalesced)'
                 }),
-                jsx(Badge, { tone: data.open.length ? 'warn' : 'muted',
-                  children: data.open.length + ' rows' }),
+                jsx(Badge, { tone: data.noData ? 'muted' : (data.open.length ? 'warn' : 'muted'),
+                  children: data.noData ? '— rows' : data.open.length + ' rows' }),
                 jsx('span', { style: { marginLeft: 'auto' } },
                   jsx(Tip, {
                     children: 'Floods collapse to ONE row with a count (MAX_GROUPS ' +
@@ -756,15 +797,34 @@ function hdayPanel09(props) {
                   }))
               ]
             }),
-            data.open.length === 0 && !data.otherRows.length
-              ? jsx('div', {
+            // unavailable probe (fetch failed / backend ok:false) → an honest
+            // placeholder, never "No open attention" (which would assert a
+            // measured zero from a probe that produced no measurements).
+            data.noData
+              ? jsxs('div', {
                   className: 'hday-empty',
-                  children: jsx('div', {
-                    className: 'hday-empty-body',
-                    children: 'No open attention. Repeats inside a window are absorbed into a single counted row.'
-                  })
+                  children: [
+                    jsxs('div', {
+                      className: 'hday-empty-body',
+                      children: ['matrix unavailable — retry']
+                    }),
+                    jsx(Button, {
+                      size: 'sm',
+                      variant: 'ghost',
+                      onClick: refetch,
+                      children: 'Refresh'
+                    })
+                  ]
                 })
-              : null,
+              : (data.open.length === 0 && !data.otherRows.length
+                ? jsx('div', {
+                    className: 'hday-empty',
+                    children: jsx('div', {
+                      className: 'hday-empty-body',
+                      children: 'No open attention. Repeats inside a window are absorbed into a single counted row.'
+                    })
+                  })
+                : null),
             data.open.map(function (row) {
               return jsx(hday09OpenRow, {
                 row: row,

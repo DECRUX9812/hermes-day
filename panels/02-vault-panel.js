@@ -1,4 +1,4 @@
-// Lane 02 — Vault & Redaction panel (first draft, splice-ready snippet).
+// Lane 02 — Vault & Redaction panel (review-fixed, splice-ready snippet).
 // SAFETY: this half only ever renders LABELS and counts. The backend seals
 // every /day-vault and /day-redact payload through its four credential
 // regexes, so no secret byte can appear here even if a payload tried to
@@ -32,7 +32,10 @@ function hdayPanel02(props) {
 
   const data = (vaultQ && vaultQ.data) || null
   const windowN = (data && data.window) || 40
-  const inWindow = (data && data.totals && data.totals.in_window) || 0
+  // gatemark 4: a failed or still-loading vault read must NEVER render as a
+  // confident 0 — null means "unknown" and the pill says so explicitly.
+  const loaded = !!(data && data.ok !== false && data.totals)
+  const inWindow = loaded ? data.totals.in_window : null
   const allSessions = (data && data.sessions) || []
   const needle = String(filter || '').trim().toLowerCase()
 
@@ -66,25 +69,68 @@ function hdayPanel02(props) {
     }
   }
 
-  // in-place scrub; the receipt below shows labels and counts only
+  // in-place scrub; the receipt below shows labels and counts only.
+  // Contract: day-redact REQUIRES a session key (a bare call is a usage
+  // error), so "redact everything" loops the visible session records
+  // instead of relying on a no-arg mass mutation.
+  function receiptOf(res) {
+    return (res.sessions || []).map(function (r) {
+      if (r.error) return String(r.session) + ': ' + r.error
+      const labels = Object.keys(r.scrubbed || {}).map(function (k) {
+        return k + '×' + r.scrubbed[k]
+      })
+      const head = String(r.session) + (r.scope ? ' [' + r.scope + ']' : '')
+      return head + ': ' + (labels.length ? labels.join(', ') : 'clean')
+    })
+  }
+
+  function invalidateVault() {
+    try { queryClient.invalidateQueries({ queryKey: ['hday-vault'] }) } catch (e) {}
+  }
+
   async function redact(sKey) {
+    if (!sKey) {
+      setStatus('redact needs a session key — nothing was changed')
+      return
+    }
     setBusy('day-redact')
-    setStatus('scrubbing ' + (sKey || 'all sessions') + '…')
+    setStatus('scrubbing ' + sKey + '…')
     const res = await dispatch('day-redact', sKey)
     setBusy('')
     if (res && res.ok) {
-      const parts = (res.sessions || []).map(function (r) {
-        const labels = Object.keys(r.scrubbed || {}).map(function (k) {
-          return k + '×' + r.scrubbed[k]
-        })
-        return String(r.session) + ': ' + (labels.length ? labels.join(', ') : 'clean')
-      })
       setStatus('redacted (labels only) — ' +
-        (parts.join(' | ') || 'nothing stored'))
-      try { queryClient.invalidateQueries({ queryKey: ['hday-vault'] }) } catch (e) {}
+        (receiptOf(res).join(' | ') || 'nothing stored'))
+      invalidateVault()
     } else {
       setStatus('redact failed: ' + ((res && res.error) || 'unknown'))
     }
+  }
+
+  async function redactAll() {
+    const keys = allSessions
+      .map(function (s) { return s.session })
+      .filter(function (k) { return !!k })
+    if (!keys.length) {
+      setStatus('no session records in view — nothing redacted')
+      return
+    }
+    setBusy('day-redact')
+    setStatus('scrubbing ' + keys.length + ' session record(s)…')
+    const parts = []
+    let failed = 0
+    for (const k of keys) {
+      const res = await dispatch('day-redact', k)
+      if (res && res.ok) {
+        parts.push(receiptOf(res).join(' | '))
+      } else {
+        failed += 1
+        parts.push(k + ': ' + ((res && res.error) || 'failed'))
+      }
+    }
+    setBusy('')
+    setStatus((failed ? failed + ' failed — ' : 'redacted (labels only) — ') +
+      (parts.join(' | ') || 'nothing stored'))
+    invalidateVault()
   }
 
   // one-key rotation guidance — the backend never executes shell for this
@@ -116,11 +162,13 @@ function hdayPanel02(props) {
             key: 'tip',
             label: shieldLabel,
             children: jsx('span', {
-              className: inWindow > 0 ? 'hday-shield text-destructive' : 'hday-shield',
-              style: inWindow > 0 ? null : { color: C.faint, borderColor: C.border },
+              className: (loaded && inWindow > 0) ? 'hday-shield text-destructive' : 'hday-shield',
+              style: (loaded && inWindow > 0) ? null : { color: C.faint, borderColor: C.border },
               children: [
                 jsx(Codicon, { name: 'shield', size: 11, key: 'i' }),
-                'secrets in context: ' + inWindow + '/' + windowN + ' window'
+                loaded
+                  ? 'secrets in context: ' + inWindow + '/' + windowN + ' window'
+                  : 'secrets in context: — (vault unread)'
               ]
             })
           }),
@@ -166,7 +214,8 @@ function hdayPanel02(props) {
                 style: { color: C.faint },
                 children: needle
                   ? 'no exposure matches "' + filter + '"'
-                  : 'no credential-shaped strings in any session window'
+                  : 'no credential-shaped strings in any recorded session ' +
+                    'window (archives not scrubbed — see scope below)'
               })
             : sessions.map(function (s) {
                 return jsxs('div', {
@@ -211,6 +260,7 @@ function hdayPanel02(props) {
                           return jsxs('div', {
                             className: 'hday-attn hday-hatch flex items-center gap-2 px-2 py-1',
                             key: 'x' + i,
+                            title: x.text || '',
                             children: [
                               jsx(Codicon, { name: 'shield', size: 11, key: 'i' }),
                               jsx('span', {
@@ -225,11 +275,24 @@ function hdayPanel02(props) {
                                   children: sg
                                 }, 's' + j)
                               }),
+                              x.redacted
+                                ? jsx(Badge, { key: 'rd', tone: 'info' }, 'redacted')
+                                : null,
+                              jsx(Button, {
+                                key: 'rx',
+                                onClick: function () {
+                                  redact(typeof x.index === 'number'
+                                    ? s.session + ' ' + x.index
+                                    : s.session)
+                                },
+                                disabled: busy === 'day-redact'
+                              }, 'Redact'),
                               jsx('span', {
                                 key: 'ts',
                                 className: 'ml-auto shrink-0 text-[0.58rem] tabular-nums',
                                 style: { color: C.faint },
-                                children: x.ts ? relativeTime(x.ts * 1000) : ''
+                                title: x.iso || '',
+                                children: x.ts ? relativeTime(x.ts * 1000) : '—'
                               })
                             ]
                           })
@@ -245,9 +308,9 @@ function hdayPanel02(props) {
         children: [
           jsx(Button, {
             key: 'ra',
-            onClick: function () { redact(sid) },
+            onClick: sid ? function () { redact(sid) } : redactAll,
             disabled: busy === 'day-redact'
-          }, sid ? 'Redact this session' : 'Redact all sessions'),
+          }, sid ? 'Redact this session' : 'Redact all sessions with exposures'),
           jsx(Button, {
             key: 'rg',
             onClick: rotateNow,
@@ -318,6 +381,26 @@ function hdayPanel02(props) {
                           jsx('span', { className: 'text-right', children: step })
                         ]
                       })
+                    }),
+                    // F3: where it lives, and a copyable verify snippet —
+                    // unverified ones are flagged in the warning tone, never
+                    // rendered as already-validated.
+                    (grp.candidates || []).map(function (c, k) {
+                      return jsxs('div', {
+                        className: 'hday-receipt-row',
+                        key: 'cand' + k,
+                        children: [
+                          jsx('span', { style: { opacity: 0.7 }, children: 'candidate' }),
+                          jsxs('span', { className: 'text-right', children: [
+                            'env ' + (c.env || '—') + ' · file ' + (c.file || '—'),
+                            jsx('br', { key: 'br' }),
+                            jsx('code', { key: 'v', className: 'font-mono', children: c.verify || '' }),
+                            c.unverified
+                              ? jsx('span', { key: 'u', style: { color: C.amber } }, ' (unverified)')
+                              : null
+                          ] })
+                        ]
+                      })
                     })
                   ]
                 })
@@ -330,7 +413,17 @@ function hdayPanel02(props) {
               })
             ]
           })
-        : null
+        : null,
+
+      // ---- scope footer: what redaction CANNOT reach (spec 6 / 5.1) ----
+      jsx('div', {
+        key: 'scope',
+        className: 'mt-1.5 text-[0.55rem]',
+        style: { color: C.faint },
+        children: 'scope: recorded session state only — live transcript, ' +
+          'Hermes session logs, shell history and vacuum archives are NOT ' +
+          'scrubbed ("archives not scrubbed")'
+      })
     ]
   })
 }

@@ -21,12 +21,13 @@ Commands only — no hooks (``plugin.yaml`` is a shared file). Every command
 body swallows, so a bug here degrades to "skin commands missing", never a
 wedged plugin.
 
-Skin values are design values, not metrics: they come from the spec's
-per-skin candidate lists, and every override line carries exactly four
-declarations so parallel edits never collide on a partial line. Tokens a
-skin's candidate list does not cover are deliberately NOT re-declared — they
-inherit the base value, so no colour outside a sanctioned list is ever
-introduced for that skin.
+Skin values are design values, not metrics: they come from the spec 1.3
+candidate lists, and every override line carries exactly four declarations
+so parallel edits never collide on a partial line. ALL THREE skins declare
+ALL 16 tokens — spec 1.2 forbids partial skins, so no token silently inherits
+a base value and no colour outside the sanctioned candidate list is ever
+introduced. (glow mirrors a skin's own accent from that same list;
+scan-alpha is its overlay opacity, <= 35%.)
 """
 
 import re
@@ -43,8 +44,8 @@ SKINS = ("current", "phosphor", "oxide")
 
 SKIN_BLURB = {
     "current": "blue-slate cockpit, preserved from C / --ui-* (auto default)",
-    "phosphor": "CRT green — accent/danger overrides from the green candidate list",
-    "oxide": "amber/red rust — dark oxide surfaces + amber accent list",
+    "phosphor": "CRT green — all 16 tokens from the phosphor candidate list",
+    "oxide": "amber/red rust — all 16 tokens from the oxide candidate list",
 }
 
 SKIN_COLOR_BEGIN = "/* == hday-skin:COLORS BEGIN == */"
@@ -67,17 +68,19 @@ SKIN_COLOR_CSS = (
 --hday-accent:#38bdf8;--hday-ok:#34d399;--hday-warn:#f59e0b;--hday-danger:#ef4444;
 --hday-slate:#8b949e;--hday-kind-input:#c084fc;--hday-glow:#38bdf8;--hday-scan-alpha:18%}
 
-/* --- skin "phosphor": CRT green. Only hexes from the phosphor candidate
-       list (accents + danger). Surfaces, warn, slate, ink-3 inherit base —
-       re-declaring them would need a hex outside the candidate list. */
-.hday-root[data-hday-skin="phosphor"]{--hday-ink:#8fffce;--hday-ink-2:#7dffbc;--hday-accent:#33ff77;--hday-glow:#33ff77;
---hday-ok:#4dff9e;--hday-danger:#ff5252;--hday-kind-input:#7dffbc;--hday-scan-alpha:30%}
+/* --- skin "phosphor": CRT green. All 16 tokens, spec 1.3 candidate values;
+       glow mirrors the phosphor accent, scan-alpha is the overlay opacity. */
+.hday-root[data-hday-skin="phosphor"]{--hday-canvas:#050b06;--hday-surface:#0a140c;--hday-surface-2:#0e1a11;--hday-line:#17301d;
+--hday-line-hot:#235c2f;--hday-ink:#d8ffe0;--hday-ink-2:#7fd398;--hday-ink-3:#4a8f61;
+--hday-accent:#33ff77;--hday-ok:#33ff77;--hday-warn:#b8ff3c;--hday-danger:#ff4d4d;
+--hday-slate:#6ea882;--hday-kind-input:#b8ff3c;--hday-glow:#33ff77;--hday-scan-alpha:30%}
 
-/* --- skin "oxide": amber/red rust. Surfaces + accents from the oxide
-       candidate list; ok/slate/ink/ink-3 inherit base. */
-.hday-root[data-hday-skin="oxide"]{--hday-canvas:#140d0b;--hday-surface:#1c1210;--hday-surface-2:#241714;--hday-line:#38231c;
---hday-line-hot:#4a2f25;--hday-accent:#ff8c42;--hday-glow:#ff8c42;--hday-warn:#ffab70;
---hday-danger:#e2483f;--hday-ink-2:#ffb98a;--hday-kind-input:#ff9a5c;--hday-scan-alpha:22%}
+/* --- skin "oxide": amber/red rust. All 16 tokens, spec 1.3 candidate
+       values; glow mirrors the oxide accent, scan-alpha is the opacity. */
+.hday-root[data-hday-skin="oxide"]{--hday-canvas:#120a06;--hday-surface:#1c110a;--hday-surface-2:#241610;--hday-line:#3a2317;
+--hday-line-hot:#5c3a24;--hday-ink:#ffeede;--hday-ink-2:#d0a183;--hday-ink-3:#967454;
+--hday-accent:#ff8c42;--hday-ok:#7dd87d;--hday-warn:#ffb02e;--hday-danger:#ff3b30;
+--hday-slate:#a88a72;--hday-kind-input:#c99aff;--hday-glow:#ff8c42;--hday-scan-alpha:22%}
 """
     + SKIN_COLOR_END
 )

@@ -6,7 +6,8 @@ Built strictly on mechanisms that exist in the real source:
   * Attention items written by ``_attn_add``: ``{kind, text, ts, ...extras}``.
   * Approval ledger entries ``{ts, choice, ms}`` — ``ms == -1`` means still
     unanswered; ``ms >= 0`` is a real human latency sample. The spec-named
-    real samples 400 / 1100 / 6200 ms define the three latency_factor bands.
+    thresholds 400 / 1100 / 6200 ms (reported only as ``bands_ms``) define
+    the three latency_factor bands — they are never presented as samples.
   * Persistence mirrors ``_persist()`` exactly: ``ctx.state.set("escalation",
     blob)`` inside ``try/except`` — a save can never throw.
   * Delivery mirrors the desktop's guarded call: every notify sits inside
@@ -51,7 +52,8 @@ _ATTN_KINDS = (
 
 _MAX_GROUPS = 40                   # == _MAX_ATTN (per-session mirror cap)
 _BODY_CAP = 140                    # same notify body slice as the desktop
-_MS_BANDS = (400, 1100, 6200)      # real approval-ledger samples (spec §0/§5)
+_MS_BANDS = (400, 1100, 6200)      # spec thresholds (spec §0/§5) — NOT measured
+                                   # fleet statistics; surfaced only as bands_ms
 _DEFAULT_QUIET = (22 * 60, 7 * 60)  # 22:00–07:00 local (spec §4)
 _DELIVERIES = ("silent", "badge", "notify")
 _QUIET_CHOICES = ("never", "badge", "silent")
@@ -340,8 +342,10 @@ def _sessions():
 def ledger_ms_samples(limit=12):
     """REAL approval-latency samples (ms) from the persisted ledger.
 
-    Falls back to the spec-named samples 400/1100/6200 (which define the
-    bands) when no answered approval exists yet. Never raises.
+    Returns only measurements that exist: an empty list when no answered
+    approval exists yet (or the read fails) — never the spec thresholds
+    400/1100/6200 dressed up as samples. Those are band thresholds and are
+    reported separately as ``bands_ms``. Never raises.
     """
     try:
         pairs = []
@@ -365,9 +369,9 @@ def ledger_ms_samples(limit=12):
                     continue
         pairs.sort()
         samples = [m for _ts, m in pairs[-limit:]]
-        return samples or [float(v) for v in _MS_BANDS]
+        return samples
     except Exception:
-        return [float(v) for v in _MS_BANDS]
+        return []
 
 
 def _quiet_window():
@@ -553,7 +557,7 @@ def ack(key="*"):
 
 
 def _latency_factor(ms, pending_age_s=0.0):
-    """Bands from the real ledger samples 400/1100/6200 ms (spec §5)."""
+    """Spec §5 bands, delimited by the thresholds 400/1100/6200 ms."""
     try:
         if ms is None:
             return 1.0                       # not approval-backed: no invention
@@ -562,7 +566,7 @@ def _latency_factor(ms, pending_age_s=0.0):
             # unanswered: (now - ts)/1000 — pending age, grows linearly.
             return max(1.0, float(pending_age_s))
         if ms <= _MS_BANDS[1]:
-            return 1.0                       # 0..1100 (samples 400, 1100)
+            return 1.0                       # 0..1100 (thresholds 400, 1100)
         if ms < _MS_BANDS[2]:
             return 1.0 + 0.3 * (ms - _MS_BANDS[1]) / (_MS_BANDS[2] - _MS_BANDS[1])
         return 1.3                           # >= 6200 (slow human)
@@ -676,7 +680,13 @@ def _annotate_and_deliver(row, entry, now, created=False):
         rung, action = _rung(entry, age_min, False)
         row["rung"], row["action"] = rung, action
         row["effective"] = _effective_delivery(entry, row, now)
-        window = float(entry.get("coalesce_s") or 60) or 60.0
+        # delivery absorption has a 60s floor even when coalesce is 'never'
+        # (coalesce_s == 0 means "never coalesce" in the matrix config, but a
+        # zero window must not mean "absorb nothing" — max() states the floor
+        # explicitly instead of an `or 60` artifact).
+        raw_window = entry.get("coalesce_s")
+        window = (60.0 if raw_window in (None, "")
+                  else max(60.0, float(raw_window)))
         if row.get("effective") != "notify":
             return row.get("effective")
         with ESC_LOCK:
@@ -1016,6 +1026,12 @@ def _fmt_clock(minute):
 def _table_text(payload):
     """The §6 routing table as plain text (chat command view). Never raises."""
     try:
+        if payload.get("ok") is False:
+            # failed probe: report unavailability, never a confident zero
+            return ("ROUTING — escalation matrix    debt —\n"
+                    "matrix unavailable (%s) — no measurement was taken, "
+                    "this is not a zero." % str(payload.get("error")
+                                                or "backend error"))
         lines = []
         debt = payload.get("debt") or {}
         quiet = payload.get("quiet") or {}
@@ -1054,8 +1070,9 @@ def _table_text(payload):
                 "acked" if row.get("acked")
                 else "unacked %sm" % row.get("age_min")))
         samples = payload.get("ms_samples") or []
-        lines.append("ledger ms: %s" % "/".join(
-            str(int(s)) for s in samples))
+        lines.append("ledger ms: %s" % (
+            "/".join(str(int(s)) for s in samples)
+            if samples else "(no answered approvals yet)"))
         lines.append("edit: day-matrix-set <kind> <delivery|coalesce|quiet|"
                      "escalate|ladder> <value>  ·  ack: day-attn-ack <*|key>")
         return "\n".join(lines)
@@ -1185,8 +1202,11 @@ def cmd_debt(arg="", **_kw):
                 float(debt.get("total") or 0.0),
                 int(debt.get("open") or 0),
                 int(debt.get("unacked") or 0)),
-            "  ledger ms samples: %s" % ("/".join(
-                str(int(s)) for s in samples)),
+            "  ledger ms samples: %s" % (
+                "/".join(str(int(s)) for s in samples)
+                if samples else "(no answered approvals yet)"),
+            "  bands thresholds (spec, not samples): %s" % "/".join(
+                str(v) for v in _MS_BANDS),
         ]
         for sk, value in sorted(debt.get("by_session", {}).items(),
                                 key=lambda kv: -kv[1]):

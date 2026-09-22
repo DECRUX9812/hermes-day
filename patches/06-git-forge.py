@@ -92,7 +92,7 @@ def _guard(argv):
     for item in out:
         if "\x00" in item:
             raise ForgeUsage("NUL byte in subprocess argument")
-        if item == _FORBIDDEN_FLAG or item.startswith(_FORBIDDEN_FLAG + "="):
+        if item.startswith(_FORBIDDEN_FLAG):
             raise ForgeUsage(
                 "force-push flags are refused by the git-forge guard"
             )
@@ -313,32 +313,37 @@ def _envelope(**kw):
 
 
 def _actions(prs):
-    """Per-PR verbs, spec §2.3."""
+    """Per-PR verbs, spec §2.3: {id, key, label, target}; target is the PR
+    number as an int, null for the tag action (spec's own shape)."""
     out = []
     for row in prs:
         n = row.get("number")
         if n is None:
             continue
+        try:
+            num = int(n)
+        except (TypeError, ValueError):
+            continue
         out.append(
-            {"id": "comment-%s" % n, "kind": "comment", "label": "Comment",
-             "target": str(n)}
+            {"id": "comment-%s" % num, "kind": "comment", "key": "c",
+             "label": "Comment", "target": num}
         )
         out.append(
-            {"id": "approve-%s" % n, "kind": "review", "verb": "approve",
-             "label": "Approve", "target": str(n)}
+            {"id": "approve-%s" % num, "kind": "review", "verb": "approve",
+             "key": "a", "label": "Approve", "target": num}
         )
         out.append(
-            {"id": "changes-%s" % n, "kind": "review",
-             "verb": "request-changes", "label": "Request changes",
-             "target": str(n)}
+            {"id": "changes-%s" % num, "kind": "review",
+             "verb": "request-changes", "key": "r",
+             "label": "Request changes", "target": num}
         )
         out.append(
-            {"id": "diff-%s" % n, "kind": "diff", "label": "View diff",
-             "target": str(n)}
+            {"id": "diff-%s" % num, "kind": "diff", "key": "d",
+             "label": "View diff", "target": num}
         )
     out.append(
-        {"id": "tag-next", "kind": "release", "label": "Tag next release",
-         "target": ""}
+        {"id": "tag-next", "kind": "release", "key": "t",
+         "label": "Tag next release", "target": None}
     )
     return out
 
@@ -380,6 +385,8 @@ def _pr_row(d):
         "head": d.get("headRefName") or "",
         "mergeable": d.get("mergeable") or "",
         "review": d.get("reviewDecision") or "",
+        "review_decision": d.get("reviewDecision") or None,
+        "draft": bool(d.get("draft")),
         "updated": d.get("updatedAt") or "",
         "url": d.get("url") or "",
         "checks": None,
@@ -452,7 +459,7 @@ def _normalize_rollup(rollup):
                       "url": str(url)})
     if not items:
         return {"state": "NONE", "total": 0, "done": 0, "failed": 0,
-                "pending": 0, "items": []}
+                "pending": 0, "items": [], "fallback": None}
     if failed:
         state = "FAILURE"
     elif pending:
@@ -460,7 +467,8 @@ def _normalize_rollup(rollup):
     else:
         state = "SUCCESS"
     return {"state": state, "total": len(items), "done": len(items) - pending,
-            "failed": failed, "pending": pending, "items": items[:30]}
+            "failed": failed, "pending": pending, "items": items[:30],
+            "fallback": None}
 
 
 # --------------------------------------------------------------------------
@@ -490,7 +498,7 @@ def _action_list(root, repo, auth, pr_state="open", issue_state="open",
                     root,
                     ["pr", "list", "-R", repo, "--state", pr_state,
                      "--json",
-                     "number,title,state,headRefName,mergeable,updatedAt,url,reviewDecision",
+                     "number,title,state,draft,headRefName,mergeable,updatedAt,url,reviewDecision",
                      "--limit", "50"],
                 )
             ]
@@ -592,12 +600,13 @@ def _action_checks(root, repo, auth, token):
             try:
                 st = _gh_json(root, ["api",
                                      "repos/%s/commits/%s/status" % (repo, sha)])
-                total = int(st.get("total_count") or 0)
+                statuses = st.get("statuses") or []
+                total = int(st.get("total_count") or len(statuses))
                 items = []
                 failed = 0
                 pending = 0
                 done = 0
-                for s in (st.get("statuses") or [])[:30]:
+                for s in statuses[:30]:
                     val = str(s.get("state") or "").upper()
                     if val in _FAIL_STATES:
                         failed += 1
@@ -621,7 +630,9 @@ def _action_checks(root, repo, auth, token):
                     state = "NONE"
                 checks = {"state": state, "total": total, "done": done,
                           "failed": failed, "pending": pending,
-                          "items": items}
+                          "items": items,
+                          "fallback": {"state": str(st.get("state") or ""),
+                                       "total_count": total}}
             except ForgeDegrade:
                 pass
             except Exception:
@@ -805,8 +816,9 @@ def _action_release(root, repo, auth, tag, mode, title):
     # 4. optional gh release (only when the title/notes action is used)
     if mode == "gh":
         rel_title = (title or "").strip() or tag
+        notes = (title or "").strip() or ("release %s (%s)" % (tag, head))
         try:
-            with _body_file(rel_title, tag) as path:
+            with _body_file(notes, tag) as path:
                 cp = _gh(root, "release", "create", tag,
                           "--title", rel_title, "--notes-file", path,
                           "-R", repo, timeout=_WRITE_TIMEOUT)

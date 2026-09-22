@@ -176,19 +176,12 @@ def _render_staged(g, cwd, target_root, staged_items):
                                 fn0.__defaults__, fn0.__closure__)
         block = str(fn(cwd) or "")
     except Exception:
-        # Last resort: the same overlay, temporarily on the real namespace
-        # under this lane's lock. Still the real renderer; near-impossible
-        # path (module-level def builds without a closure).
-        with _LOCK:
-            prev_load = g.get("_load_instincts")
-            prev_roots = g.get("_instinct_roots")
-            g["_load_instincts"] = overlay_load
-            g["_instinct_roots"] = overlay_roots
-            try:
-                block = str(fn0(cwd) or "")
-            finally:
-                g["_load_instincts"] = prev_load
-                g["_instinct_roots"] = prev_roots
+        # Never overlay the LIVE module namespace: the core renderer does not
+        # take this lane's _LOCK, so a concurrent render could observe the
+        # overlaid ledger. Refuse instead; _cmd_instinct_preview's except
+        # turns this into ok:false (near-impossible path anyway: a module-level
+        # def builds without a closure, so FunctionType binding cannot fail).
+        raise RuntimeError("staged render unavailable (FunctionType bind failed)")
     return block, str(target_root) in called
 
 
@@ -393,6 +386,7 @@ def _cmd_instinct_preview(arg=""):
         lines = 0 if not stripped else max(0, len(stripped.split("\n")) - 2)
         return json.dumps({
             "ok": True,
+            "gate": _enabled_gate(g),       # real gate state — never inferred from chars
             "block": block,                 # raw section bytes, un-stripped (L443)
             "chars": chars,                 # len(block.strip()) — dispatch L503/L509
             "lines": lines,                 # content lines; wrapper header/footer excluded
@@ -478,13 +472,13 @@ def _cmd_instinct_status(arg=""):
         rows = []
         with _LOCK:
             # Lane lock per BRIEF (main's _LOCK is off-limits to patches);
-            # snapshot defensively since we cannot serialise with its writers.
-            for attempt in range(2):
-                try:
-                    pairs = list(recs.items()) if isinstance(recs, dict) else []
-                    break
-                except RuntimeError:
-                    pairs = [] if attempt else []
+            # snapshot defensively — a RuntimeError here means another writer
+            # mutated _SESSIONS mid-iteration, so we report no rows rather
+            # than a torn view. No retry: the result would be identical.
+            try:
+                pairs = list(recs.items()) if isinstance(recs, dict) else []
+            except RuntimeError:
+                pairs = []
         for sid, rec in pairs:
             try:
                 if not isinstance(rec, dict):
@@ -497,7 +491,8 @@ def _cmd_instinct_status(arg=""):
             except Exception:
                 continue
         block = _render_block(g, _ambient_cwd())
-        return json.dumps({"sessions": rows, "block_chars": len(block.strip())})
+        return json.dumps({"ok": True, "sessions": rows,
+                           "block_chars": len(block.strip())})
     except Exception as exc:
         return _err("%s: %s" % (type(exc).__name__, exc))
 

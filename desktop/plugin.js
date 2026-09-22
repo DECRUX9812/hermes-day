@@ -3447,7 +3447,7 @@ function hdayPanel01(props) {
 }
 
 // ---- lane 02: vault-panel ----
-// Lane 02 — Vault & Redaction panel (first draft, splice-ready snippet).
+// Lane 02 — Vault & Redaction panel (review-fixed, splice-ready snippet).
 // SAFETY: this half only ever renders LABELS and counts. The backend seals
 // every /day-vault and /day-redact payload through its four credential
 // regexes, so no secret byte can appear here even if a payload tried to
@@ -3481,7 +3481,10 @@ function hdayPanel02(props) {
 
   const data = (vaultQ && vaultQ.data) || null
   const windowN = (data && data.window) || 40
-  const inWindow = (data && data.totals && data.totals.in_window) || 0
+  // gatemark 4: a failed or still-loading vault read must NEVER render as a
+  // confident 0 — null means "unknown" and the pill says so explicitly.
+  const loaded = !!(data && data.ok !== false && data.totals)
+  const inWindow = loaded ? data.totals.in_window : null
   const allSessions = (data && data.sessions) || []
   const needle = String(filter || '').trim().toLowerCase()
 
@@ -3515,25 +3518,68 @@ function hdayPanel02(props) {
     }
   }
 
-  // in-place scrub; the receipt below shows labels and counts only
+  // in-place scrub; the receipt below shows labels and counts only.
+  // Contract: day-redact REQUIRES a session key (a bare call is a usage
+  // error), so "redact everything" loops the visible session records
+  // instead of relying on a no-arg mass mutation.
+  function receiptOf(res) {
+    return (res.sessions || []).map(function (r) {
+      if (r.error) return String(r.session) + ': ' + r.error
+      const labels = Object.keys(r.scrubbed || {}).map(function (k) {
+        return k + '×' + r.scrubbed[k]
+      })
+      const head = String(r.session) + (r.scope ? ' [' + r.scope + ']' : '')
+      return head + ': ' + (labels.length ? labels.join(', ') : 'clean')
+    })
+  }
+
+  function invalidateVault() {
+    try { queryClient.invalidateQueries({ queryKey: ['hday-vault'] }) } catch (e) {}
+  }
+
   async function redact(sKey) {
+    if (!sKey) {
+      setStatus('redact needs a session key — nothing was changed')
+      return
+    }
     setBusy('day-redact')
-    setStatus('scrubbing ' + (sKey || 'all sessions') + '…')
+    setStatus('scrubbing ' + sKey + '…')
     const res = await dispatch('day-redact', sKey)
     setBusy('')
     if (res && res.ok) {
-      const parts = (res.sessions || []).map(function (r) {
-        const labels = Object.keys(r.scrubbed || {}).map(function (k) {
-          return k + '×' + r.scrubbed[k]
-        })
-        return String(r.session) + ': ' + (labels.length ? labels.join(', ') : 'clean')
-      })
       setStatus('redacted (labels only) — ' +
-        (parts.join(' | ') || 'nothing stored'))
-      try { queryClient.invalidateQueries({ queryKey: ['hday-vault'] }) } catch (e) {}
+        (receiptOf(res).join(' | ') || 'nothing stored'))
+      invalidateVault()
     } else {
       setStatus('redact failed: ' + ((res && res.error) || 'unknown'))
     }
+  }
+
+  async function redactAll() {
+    const keys = allSessions
+      .map(function (s) { return s.session })
+      .filter(function (k) { return !!k })
+    if (!keys.length) {
+      setStatus('no session records in view — nothing redacted')
+      return
+    }
+    setBusy('day-redact')
+    setStatus('scrubbing ' + keys.length + ' session record(s)…')
+    const parts = []
+    let failed = 0
+    for (const k of keys) {
+      const res = await dispatch('day-redact', k)
+      if (res && res.ok) {
+        parts.push(receiptOf(res).join(' | '))
+      } else {
+        failed += 1
+        parts.push(k + ': ' + ((res && res.error) || 'failed'))
+      }
+    }
+    setBusy('')
+    setStatus((failed ? failed + ' failed — ' : 'redacted (labels only) — ') +
+      (parts.join(' | ') || 'nothing stored'))
+    invalidateVault()
   }
 
   // one-key rotation guidance — the backend never executes shell for this
@@ -3565,11 +3611,13 @@ function hdayPanel02(props) {
             key: 'tip',
             label: shieldLabel,
             children: jsx('span', {
-              className: inWindow > 0 ? 'hday-shield text-destructive' : 'hday-shield',
-              style: inWindow > 0 ? null : { color: C.faint, borderColor: C.border },
+              className: (loaded && inWindow > 0) ? 'hday-shield text-destructive' : 'hday-shield',
+              style: (loaded && inWindow > 0) ? null : { color: C.faint, borderColor: C.border },
               children: [
                 jsx(Codicon, { name: 'shield', size: 11, key: 'i' }),
-                'secrets in context: ' + inWindow + '/' + windowN + ' window'
+                loaded
+                  ? 'secrets in context: ' + inWindow + '/' + windowN + ' window'
+                  : 'secrets in context: — (vault unread)'
               ]
             })
           }),
@@ -3615,7 +3663,8 @@ function hdayPanel02(props) {
                 style: { color: C.faint },
                 children: needle
                   ? 'no exposure matches "' + filter + '"'
-                  : 'no credential-shaped strings in any session window'
+                  : 'no credential-shaped strings in any recorded session ' +
+                    'window (archives not scrubbed — see scope below)'
               })
             : sessions.map(function (s) {
                 return jsxs('div', {
@@ -3660,6 +3709,7 @@ function hdayPanel02(props) {
                           return jsxs('div', {
                             className: 'hday-attn hday-hatch flex items-center gap-2 px-2 py-1',
                             key: 'x' + i,
+                            title: x.text || '',
                             children: [
                               jsx(Codicon, { name: 'shield', size: 11, key: 'i' }),
                               jsx('span', {
@@ -3674,11 +3724,24 @@ function hdayPanel02(props) {
                                   children: sg
                                 }, 's' + j)
                               }),
+                              x.redacted
+                                ? jsx(Badge, { key: 'rd', tone: 'info' }, 'redacted')
+                                : null,
+                              jsx(Button, {
+                                key: 'rx',
+                                onClick: function () {
+                                  redact(typeof x.index === 'number'
+                                    ? s.session + ' ' + x.index
+                                    : s.session)
+                                },
+                                disabled: busy === 'day-redact'
+                              }, 'Redact'),
                               jsx('span', {
                                 key: 'ts',
                                 className: 'ml-auto shrink-0 text-[0.58rem] tabular-nums',
                                 style: { color: C.faint },
-                                children: x.ts ? relativeTime(x.ts * 1000) : ''
+                                title: x.iso || '',
+                                children: x.ts ? relativeTime(x.ts * 1000) : '—'
                               })
                             ]
                           })
@@ -3694,9 +3757,9 @@ function hdayPanel02(props) {
         children: [
           jsx(Button, {
             key: 'ra',
-            onClick: function () { redact(sid) },
+            onClick: sid ? function () { redact(sid) } : redactAll,
             disabled: busy === 'day-redact'
-          }, sid ? 'Redact this session' : 'Redact all sessions'),
+          }, sid ? 'Redact this session' : 'Redact all sessions with exposures'),
           jsx(Button, {
             key: 'rg',
             onClick: rotateNow,
@@ -3767,6 +3830,26 @@ function hdayPanel02(props) {
                           jsx('span', { className: 'text-right', children: step })
                         ]
                       })
+                    }),
+                    // F3: where it lives, and a copyable verify snippet —
+                    // unverified ones are flagged in the warning tone, never
+                    // rendered as already-validated.
+                    (grp.candidates || []).map(function (c, k) {
+                      return jsxs('div', {
+                        className: 'hday-receipt-row',
+                        key: 'cand' + k,
+                        children: [
+                          jsx('span', { style: { opacity: 0.7 }, children: 'candidate' }),
+                          jsxs('span', { className: 'text-right', children: [
+                            'env ' + (c.env || '—') + ' · file ' + (c.file || '—'),
+                            jsx('br', { key: 'br' }),
+                            jsx('code', { key: 'v', className: 'font-mono', children: c.verify || '' }),
+                            c.unverified
+                              ? jsx('span', { key: 'u', style: { color: C.amber } }, ' (unverified)')
+                              : null
+                          ] })
+                        ]
+                      })
                     })
                   ]
                 })
@@ -3779,7 +3862,17 @@ function hdayPanel02(props) {
               })
             ]
           })
-        : null
+        : null,
+
+      // ---- scope footer: what redaction CANNOT reach (spec 6 / 5.1) ----
+      jsx('div', {
+        key: 'scope',
+        className: 'mt-1.5 text-[0.55rem]',
+        style: { color: C.faint },
+        children: 'scope: recorded session state only — live transcript, ' +
+          'Hermes session logs, shell history and vacuum archives are NOT ' +
+          'scrubbed ("archives not scrubbed")'
+      })
     ]
   })
 }
@@ -6471,6 +6564,9 @@ function hdayPanel06(props) {
                     line: line });
       rescan();
       return env;
+    }).catch(function (e) {
+      A.busy.set(null);
+      A.strip.set({ kind: 'err', line: String(e && e.message ? e.message : e) });
     });
   }
 
@@ -6490,10 +6586,8 @@ function hdayPanel06(props) {
       act(rArg, 'review posted');
       return;
     }
-    if (tab === 'release') {
-      var t = tagValue || (data.release && data.release.next_tag) || 'v0.1.1';
-      act('release ' + t, 'tagged');
-    }
+    // Release has no Enter binding in spec §3.3: it fires only from its
+    // three labelled buttons (a click is the confirmation, like approve's 2nd step).
   }
 
   function fireArmed() {
@@ -6591,7 +6685,7 @@ function hdayPanel06(props) {
       onTag: function (v) { A.tag.set(v); },
       onRelease: function (m) {
         var t = tagValue || (data.release && data.release.next_tag) || 'v0.1.1';
-        var arg = 'release ' + t + (m === 'gh' ? ' gh ' + t : m === 'local' ? ' local' : '');
+        var arg = 'release ' + t + (m === 'gh' ? ' gh' : m === 'local' ? ' local' : '');
         act(arg, m === 'local' ? 'tagged' : 'tagged & pushed');
       },
       key: 'release'
@@ -6651,7 +6745,8 @@ function hdayPanel06(props) {
       composer,
       stripView,
       jsx('div', { className: 'hday-row', style: { color: C.faint, fontSize: '0.62rem' },
-                   children: busy ? ('running: ' + busy)
+                   children: busy
+                     ? jsx('span', { children: [spinIcon('sync'), ' running: ' + busy] })
                      : 'keys: ↑/↓ select · c comment · r review · a approve (Enter fires) · d diff · t release · Esc closes' }),
       jsx('div', { style: { color: C.faint, fontSize: '0.6rem' },
                    children: 'generated ' + hdayForgeStamp(data.generated_at) })
@@ -7750,7 +7845,7 @@ function hdayPanel08Ledger(props) {
                           off ? jsx(Badge, { size: 'xs', variant: 'muted', children: 'OFF' }) : null,
                           isShadow
                             ? jsx(Tip, {
-                                label: 'In the ledger, not in the prompt — beyond items[:8] or past lines[:16] (repo headers count).',
+                                label: 'In the ledger, not in the prompt — beyond items[:8], past lines[:16] (repo headers count), or the whole section is currently disabled.',
                                 children: jsx(Badge, { size: 'xs', variant: 'warn', children: 'SHADOWED' })
                               })
                             : null,
@@ -7881,12 +7976,13 @@ function hdayPanel08Preview(props) {
             children: 'SECTION MARKERS PRESENT — dispatch skips it (reserved persistence marker).'
           })
         : null,
-      !over && !markers && chars === 0 && !loading
+      !over && !markers && chars === 0 && !loading && !error
         ? jsx('div', {
             className: 'text-[0.6rem]',
-            style: { color: enabledInScope ? C.amber : C.faint },
-            children: enabledInScope
+            style: { color: view && view.data && view.data.gate === false ? C.faint : C.amber },
+            children: (view && view.data && view.data.gate === false)
               ? 'SECTION DISABLED (gate.instincts) — nothing is injected while the gate is off.'
+              : enabledInScope ? 'Empty block — preview did not render (see the error above).'
               : 'No enabled instincts — nothing to inject.'
           })
         : null,
@@ -8019,6 +8115,10 @@ function hdayPanel08(props) {
     frozen = statusQ.data.sessions.filter(function (s) { return Number(s.inst_epoch) > 0 }).length
   }
 
+  // A backend refusal (ok:false) must surface, not fall through to the other
+  // view: a failed STAGED render never silently falls back to SAVED bytes.
+  var backendErr = (stagedQ.data && stagedQ.data.ok === false) ? stagedQ.data.error
+    : (liveQ.data && liveQ.data.ok === false) ? liveQ.data.error : null
   var shadowed = []
   var view = null
   var viewLoading = liveQ.isLoading
@@ -8030,11 +8130,10 @@ function hdayPanel08(props) {
       stale: Boolean(editing && staged && staged.value !== hdayPanel08Brief(editing.draft))
     }
     viewLoading = stagedQ.isLoading
-    viewError = stagedQ.data && stagedQ.data.ok === false ? stagedQ.data.error : null
   } else if (liveQ.data && liveQ.data.ok !== false) {
     view = { mode: 'SAVED', data: liveQ.data, stale: false }
-    viewError = liveQ.data && liveQ.data.ok === false ? liveQ.data.error : null
   }
+  viewError = viewError || backendErr
   if (view && view.data) shadowed = view.data.shadowed || []
 
   function setFailedKey(key, bad) {
@@ -8568,7 +8667,29 @@ function hday09Reset(route, refetch) {
 
 function hday09Data(query) {
   try {
-    var raw = (query && query.data) || {};
+    // A rejected/non-JSON fetch or a backend failure yields null / ok:false —
+    // that is an UNAVAILABLE probe, never a measured zero (gate 4).
+    var raw = (query && query.data) || null;
+    var noData = !raw || raw.ok === false;
+    if (noData) {
+      var emptyCounts = {};
+      hday09Kinds().forEach(function (kind) { emptyCounts[kind] = 0; });
+      return {
+        matrix: hday09DefaultMatrix(),
+        rows: [],
+        open: [],
+        counts: emptyCounts,
+        otherRows: [],
+        otherCount: 0,
+        unknownKinds: [],
+        total: null,
+        unacked: null,
+        quiet: null,
+        samples: [],
+        lastFetch: null,
+        noData: true
+      };
+    }
     var kinds = hday09Kinds();
     var defaults = hday09DefaultMatrix();
     var stored = raw.matrix || {};
@@ -8606,6 +8727,10 @@ function hday09Data(query) {
       return kinds.indexOf(kind) < 0;
     });
     var debt = raw.debt || {};
+    var total = (debt.total !== undefined && debt.total !== null &&
+                 isFinite(Number(debt.total))) ? Number(debt.total) : null;
+    var unacked = (debt.unacked !== undefined && debt.unacked !== null &&
+                   isFinite(Number(debt.unacked))) ? Number(debt.unacked) : null;
     return {
       matrix: matrix,
       rows: rows,
@@ -8614,26 +8739,30 @@ function hday09Data(query) {
       otherRows: otherRows,
       otherCount: otherCount,
       unknownKinds: unknownKinds,
-      total: Number(debt.total) || 0,
-      unacked: Number(debt.unacked) || 0,
+      total: total,
+      unacked: unacked,
       quiet: raw.quiet || null,
-      samples: raw.ms_samples || [],
-      lastFetch: raw.generated_at || null
+      samples: Array.isArray(raw.ms_samples) ? raw.ms_samples : [],
+      lastFetch: raw.generated_at || null,
+      noData: false
     };
   } catch (e) {
+    var catchCounts = {};
+    hday09Kinds().forEach(function (kind) { catchCounts[kind] = 0; });
     return {
       matrix: hday09DefaultMatrix(),
       rows: [],
       open: [],
-      counts: {},
+      counts: catchCounts,
       otherRows: [],
       otherCount: 0,
       unknownKinds: [],
-      total: 0,
-      unacked: 0,
+      total: null,
+      unacked: null,
       quiet: null,
       samples: [],
-      lastFetch: null
+      lastFetch: null,
+      noData: true
     };
   }
 }
@@ -8644,7 +8773,12 @@ function hday09ExpandAtom() {
     try {
       hday09ExpandAtom._atom = atom({});
     } catch (e) {
-      hday09ExpandAtom._atom = null;
+      // Non-null fallback so useValue is called exactly once every render
+      // (rules of hooks) — a no-op store instead of `null`.
+      hday09ExpandAtom._atom = {
+        get: function () { return {}; },
+        set: function () {}
+      };
     }
   }
   return hday09ExpandAtom._atom;
@@ -8736,7 +8870,7 @@ function hday09KindRow(props) {
       hday09CycleCell({
         label: hday09CoalesceText(entry.coalesce_s),
         color: C.text,
-        title: 'Click to cycle coalesce window: 30s → 1m → 5m → 10m → never',
+        title: 'Click to cycle coalesce window: 30s → 1m → 5m → 10m → never (notify absorption always keeps a 60s floor)',
         onClick: function () {
           props.onSet(kind, 'coalesce', String(nextCoalesce));
         }
@@ -8944,24 +9078,27 @@ function hdayPanel09(props) {
     queryFn: function () {
       try {
         var pending = rpc(route, 'command.dispatch', { name: 'day-matrix', arg: 'json' });
+        // failure branches: a rejected RPC or non-JSON output is an
+        // UNAVAILABLE probe — null, so the panel shows 'debt —' instead of
+        // an invented healthy zero (gate 4).
         var parse = function (disp) {
           try {
             var out = disp && (disp.output || disp.text || '');
             return out && String(out).trim().charAt(0) === '{'
               ? JSON.parse(out)
-              : { matrix: {}, rows: [], debt: {}, quiet: null };
+              : null;
           } catch (e) {
-            return { matrix: {}, rows: [], debt: {}, quiet: null };
+            return null;
           }
         };
         if (pending && typeof pending.then === 'function') {
           return pending.then(parse, function () {
-            return { matrix: {}, rows: [], debt: {}, quiet: null };
+            return null;
           });
         }
         return parse(pending);
       } catch (e) {
-        return { matrix: {}, rows: [], debt: {}, quiet: null };
+        return null;
       }
     },
     staleTime: 4000,
@@ -8971,7 +9108,7 @@ function hdayPanel09(props) {
   });
 
   var expandAtom = hday09ExpandAtom();
-  var expanded = (expandAtom && useValue(expandAtom)) || {};
+  var expanded = useValue(expandAtom) || {};
 
   var data = hday09Data(query);
   var kinds = hday09Kinds();
@@ -8991,7 +9128,10 @@ function hdayPanel09(props) {
 
   var quiet = data.quiet || {};
   var quietLabel = hday09Clock(quiet.start, '22:00') + '–' + hday09Clock(quiet.end, '07:00');
-  var debtColor = data.total > 0 ? C.amber : C.emerald;
+  // null debt = probe unavailable → neutral, never a healthy emerald zero.
+  var debtColor = data.total === null
+    ? C.muted
+    : (data.total > 0 ? C.amber : C.emerald);
 
   return jsx('div', {
     className: cn('hday-panel hday-matrix', props.className),
@@ -9035,13 +9175,13 @@ function hdayPanel09(props) {
                 jsx('span', {
                   className: 'text-[0.72rem] tabular-nums',
                   style: { color: debtColor, fontWeight: 700 },
-                  children: 'debt ' + data.total.toFixed(1)
+                  children: data.total === null ? 'debt —' : 'debt ' + data.total.toFixed(1)
                 }),
                 jsx(Codicon, { name: 'chevron-right', size: 12, style: { color: debtColor } }),
                 jsx('span', {
                   className: 'text-[0.58rem] tabular-nums',
                   style: { color: C.faint },
-                  children: data.unacked + ' unacked'
+                  children: (data.unacked === null ? '—' : String(data.unacked)) + ' unacked'
                 }),
                 jsx(Button, {
                   size: 'sm',
@@ -9101,8 +9241,8 @@ function hdayPanel09(props) {
                   style: { color: C.faint },
                   children: 'open attention (coalesced)'
                 }),
-                jsx(Badge, { tone: data.open.length ? 'warn' : 'muted',
-                  children: data.open.length + ' rows' }),
+                jsx(Badge, { tone: data.noData ? 'muted' : (data.open.length ? 'warn' : 'muted'),
+                  children: data.noData ? '— rows' : data.open.length + ' rows' }),
                 jsx('span', { style: { marginLeft: 'auto' } },
                   jsx(Tip, {
                     children: 'Floods collapse to ONE row with a count (MAX_GROUPS ' +
@@ -9110,15 +9250,34 @@ function hdayPanel09(props) {
                   }))
               ]
             }),
-            data.open.length === 0 && !data.otherRows.length
-              ? jsx('div', {
+            // unavailable probe (fetch failed / backend ok:false) → an honest
+            // placeholder, never "No open attention" (which would assert a
+            // measured zero from a probe that produced no measurements).
+            data.noData
+              ? jsxs('div', {
                   className: 'hday-empty',
-                  children: jsx('div', {
-                    className: 'hday-empty-body',
-                    children: 'No open attention. Repeats inside a window are absorbed into a single counted row.'
-                  })
+                  children: [
+                    jsxs('div', {
+                      className: 'hday-empty-body',
+                      children: ['matrix unavailable — retry']
+                    }),
+                    jsx(Button, {
+                      size: 'sm',
+                      variant: 'ghost',
+                      onClick: refetch,
+                      children: 'Refresh'
+                    })
+                  ]
                 })
-              : null,
+              : (data.open.length === 0 && !data.otherRows.length
+                ? jsx('div', {
+                    className: 'hday-empty',
+                    children: jsx('div', {
+                      className: 'hday-empty-body',
+                      children: 'No open attention. Repeats inside a window are absorbed into a single counted row.'
+                    })
+                  })
+                : null),
             data.open.map(function (row) {
               return jsx(hday09OpenRow, {
                 row: row,
@@ -9228,19 +9387,34 @@ function hdayUseReducedMotion() {
 
 // ---------------------------------------------------------------------------
 // KEYMAP_ROWS — the cheatsheet UI and its source trace read this ONE array.
-// Every binding here is verified present in desktop/plugin.js:
-//   j/k/a/d/s/o -> the triage keydown handler, 'mod+shift+i' -> host keybinds.
+// Every binding here is verified present in desktop/plugin.js. Two trace
+// fields per row:
+//   symbol  what the SOURCE column PRINTS — a stable name, because plugin.js
+//           line numbers drift on every splice (the old 3036/3039/3043/3045/
+//           3047/3049/911/3120 cites were stale post-splice and 911/3120
+//           never pointed at the binding at all), and F1-F3's fixes to
+//           plugin.js will shift them again.
+//   line    a SNAPSHOT of the verified site, kept as build evidence only —
+//           plugin.js is still being edited by its lane owner, so numbers
+//           move (they already did: 9864 -> 9880 between two greps a minute
+//           apart). Re-grep before trusting it. Last verified snapshot
+//           (working tree, HEAD b63b256): Day keydown handler j/ArrowDown
+//           9880, k/ArrowUp 9883, a 9887, d 9889, s 9891, o/Enter 9893
+//           (route-gated to /day, meta/ctrl/alt abort, skipped while focus is
+//           in an input; shiftKey is NOT filtered); keybind.open id 10359 with
+//           defaults ['mod+shift+i'] 10366; click via FeedRow onSelect 1873
+//           (wired to setSel at 9935).
 // ---------------------------------------------------------------------------
 function hdayKeymapRows() {
   return [
-    { keys: ['j'], action: 'Next row', note: 'feed select + 1', gate: 'always', gateLabel: '—', line: 'plugin.js:3036' },
-    { keys: ['k'], action: 'Previous row', note: 'feed select - 1', gate: 'always', gateLabel: '—', line: 'plugin.js:3039' },
-    { keys: ['a'], action: 'Approve selected approval', note: 'deny stays on d', gate: 'approval', gateLabel: 'selected approval', line: 'plugin.js:3043' },
-    { keys: ['d'], action: 'Deny selected approval', note: 'once-per-request', gate: 'approval', gateLabel: 'selected approval', line: 'plugin.js:3045' },
-    { keys: ['s'], action: 'Snooze selected request', note: 'hides the card until later', gate: 'need', gateLabel: 'selected need', line: 'plugin.js:3047' },
-    { keys: ['o'], action: 'Open selected session', note: 'Enter does the same', gate: 'row', gateLabel: 'a row is selected', line: 'plugin.js:3049' },
-    { keys: ['mod', 'shift', 'i'], action: 'Toggle the day panel', note: 'host chrome keybind', gate: 'global', gateLabel: 'global', line: 'plugin.js:911' },
-    { keys: ['click'], action: 'Select row', note: 'mouse equivalent of j/k', gate: 'row', gateLabel: 'a row is selected', line: 'plugin.js:3120' }
+    { keys: ['j', '\u2193'], action: 'Next row', note: 'feed select + 1', gate: 'always', gateLabel: '—', symbol: 'DayPage keydown', line: 'plugin.js:9880' },
+    { keys: ['k', '\u2191'], action: 'Previous row', note: 'feed select - 1', gate: 'always', gateLabel: '—', symbol: 'DayPage keydown', line: 'plugin.js:9883' },
+    { keys: ['a'], action: 'Approve selected approval', note: 'deny stays on d', gate: 'approval', gateLabel: 'selected approval', symbol: 'DayPage keydown', line: 'plugin.js:9887' },
+    { keys: ['d'], action: 'Deny selected approval', note: 'once-per-request', gate: 'approval', gateLabel: 'selected approval', symbol: 'DayPage keydown', line: 'plugin.js:9889' },
+    { keys: ['s'], action: 'Snooze selected request', note: 'hides the card until later', gate: 'need', gateLabel: 'selected need', symbol: 'DayPage keydown', line: 'plugin.js:9891' },
+    { keys: ['o', 'Enter'], action: 'Open selected session', note: 'mouse equivalent is the row click', gate: 'row', gateLabel: 'a row is selected', symbol: 'DayPage keydown', line: 'plugin.js:9893' },
+    { keys: ['mod', 'shift', 'i'], action: 'Toggle the day panel', note: 'host chrome keybind', gate: 'global', gateLabel: 'global', symbol: 'keybind.open', line: 'plugin.js:10366' },
+    { keys: ['click'], action: 'Select row', note: 'mouse equivalent of j/k', gate: 'row', gateLabel: 'a row is selected', symbol: 'FeedRow onClick', line: 'plugin.js:1873' }
   ];
 }
 
@@ -9307,10 +9481,15 @@ function hdayTelemetry(props) {
 // ---------------------------------------------------------------------------
 function hdaySignalBar(props) {
   var p = props || {};
-  var raw = typeof p.needs === 'number' ? p.needs : 0;
-  var n = raw > 0 ? Math.floor(raw) : 0;
+  // GATEMARK: needs === null/undefined means the needs probe never ran.
+  // That state renders IDLE (all blocks off, count '\u2014'), never a calm 0 —
+  // a failed/absent probe must not read as "measured zero". A real number,
+  // including a real 0, renders as measured.
+  var known = typeof p.needs === 'number' && isFinite(p.needs);
+  var raw = known ? p.needs : 0;
+  var n = known && raw > 0 ? Math.floor(raw) : 0;
   var cap = 12;
-  var blocks = n > cap ? cap : n;
+  var blocks = known ? (n > cap ? cap : n) : 0;
   var kids = [];
   for (var i = 0; i < cap; i++) {
     kids.push(jsx('span', { className: 'hday-sig-block', 'data-on': i < blocks ? '1' : '0', key: 'b' + i }));
@@ -9319,14 +9498,25 @@ function hdaySignalBar(props) {
     'div',
     {
       className: 'hday-hud-signal',
-      'aria-label': n + ' need' + (n === 1 ? '' : 's') + ' waiting',
+      'data-known': known ? '1' : '0',
+      'aria-label': known
+        ? n + ' need' + (n === 1 ? '' : 's') + ' waiting'
+        : 'attention unknown — no scan yet',
       children: [
         jsxs(
           'div',
-          { className: 'hday-sig-track', 'data-hot': n > 0 ? '1' : '0', 'data-calm': n === 0 ? '1' : '0', key: 'track' },
+          {
+            className: 'hday-sig-track',
+            'data-hot': known && n > 0 ? '1' : '0',
+            'data-calm': known && n === 0 ? '1' : '0',
+            'data-idle': known ? '0' : '1',
+            key: 'track'
+          },
           kids
         ),
-        n > 0 ? jsx('span', { className: 'hday-sig-count', key: 'count' }, String(n)) : null
+        known
+          ? (n > 0 ? jsx('span', { className: 'hday-sig-count', key: 'count' }, String(n)) : null)
+          : jsx('span', { className: 'hday-sig-count hday-sig-idle', key: 'count' }, '\u2014')
       ]
     }
   );
@@ -9366,14 +9556,20 @@ function hdayKeymap(props) {
             row.note ? jsx('span', { className: 'hday-keymap-note', key: 'n' }, ' ' + row.note) : null
           ]),
           jsx('span', { className: 'hday-keymap-gate', key: 'gate' }, row.gateLabel || '—'),
-          jsx('span', { className: 'hday-keymap-src', key: 'src' }, (active ? 'ready · ' : 'idle · ') + row.line)
+          jsx('span', { className: 'hday-keymap-src', key: 'src' }, (active ? 'ready · ' : 'idle · ') + (row.symbol || row.line))
         ]
       )
     );
   });
   kids.push(
-    jsx('div', { className: 'hday-keymap-foot', key: 'foot' }, [
-      jsx(Tip, { key: 'tip' }, 'skins recolor tokens, not layout.')
+    jsxs('div', { className: 'hday-keymap-foot', key: 'foot' }, [
+      // Spec §2 requires all three footnotes in the panel:
+      // (1) ignored while focus is in an input, (2) meta/ctrl/alt abort,
+      // (3) the real quirk — shift is NOT filtered today (0 shiftKey hits).
+      jsx(Tip, { key: 'tip' },
+        'ignored while typing \u00b7 meta/ctrl/alt abort \u00b7 shift is not filtered today'),
+      jsx('div', { className: 'hday-keymap-note', key: 'skins' },
+        'skins recolor tokens, not layout.')
     ])
   );
   return jsxs('div', { className: 'hday-keymap', role: 'dialog', 'aria-label': 'In-cockpit keymap' }, kids);
@@ -9490,29 +9686,50 @@ function hdayPanel10(props) {
   }, [reduced, boot]);
 
   // ---- real counts only: array lengths and scan payload numbers ----
+  // GATEMARK: a probe that was never run (prop absent AND absent from the scan
+  // payload) is UNKNOWN — it renders an em-dash / idle state, never a
+  // confident 0. An explicitly supplied 0 or an empty array IS a measurement
+  // and prints 0 honestly. Each cell reports only what actually arrived.
   var scan = p.scan || p.data || null;
-  var needs = p.needs || (scan && scan.needs) || [];
-  var flight = p.flight || (scan && scan.flight) || [];
-  var waiting = p.waiting || (scan && scan.waiting) || [];
-  var jobs = p.jobs || [];
-  var needsLen = Array.isArray(needs) ? needs.length : typeof needs === 'number' ? needs : 0;
-  var flightLen = Array.isArray(flight) ? flight.length : typeof flight === 'number' ? flight : 0;
-  var waitingLen = Array.isArray(waiting) ? waiting.length : typeof waiting === 'number' ? waiting : 0;
-  var jobsLen = Array.isArray(jobs) ? jobs.length : typeof jobs === 'number' ? jobs : 0;
-  var hidden = typeof p.hiddenCount === 'number' ? p.hiddenCount : scan && typeof scan.hiddenCount === 'number' ? scan.hiddenCount : 0;
-  var scannedAt = typeof p.scannedAt === 'number' ? p.scannedAt : scan && typeof scan.scannedAt === 'number' ? scan.scannedAt : 0;
-  var age = hdayAgeLabel(scannedAt, now);
-  var fresh = scannedAt > 0 && now - (scannedAt < 1e12 ? scannedAt * 1000 : scannedAt) < 15000;
+  function pick(prop, scanKey) {
+    var v = p[prop];
+    if ((v === undefined || v === null) && scan && scan[scanKey] !== undefined && scan[scanKey] !== null) {
+      v = scan[scanKey];
+    }
+    return v;
+  }
+  function countOf(v) {
+    if (Array.isArray(v)) return v.length;
+    if (typeof v === 'number' && isFinite(v)) return v;
+    return null; // absent probe -> unknown
+  }
+  function numOf(v) {
+    return typeof v === 'number' && isFinite(v) ? v : null;
+  }
+  var needsLen = countOf(pick('needs', 'needs'));
+  var flightLen = countOf(pick('flight', 'flight'));
+  var waitingLen = countOf(pick('waiting', 'waiting'));
+  var jobsLen = countOf(pick('jobs', 'jobs'));
+  var hidden = numOf(pick('hiddenCount', 'hiddenCount'));
+  var scannedAt = numOf(pick('scannedAt', 'scannedAt'));
+  var age = scannedAt === null ? '\u2014' : hdayAgeLabel(scannedAt, now);
+  var fresh = scannedAt !== null && scannedAt > 0 && now - (scannedAt < 1e12 ? scannedAt * 1000 : scannedAt) < 15000;
   var feedLength = typeof p.feedLength === 'number' ? p.feedLength : 0;
   var selectedEntry = p.selectedEntry || p.selEntry || null;
 
+  // null = no probe -> em-dash; a real number (including 0) prints as measured
+  function cell(v) {
+    return v === null ? '\u2014' : v;
+  }
   var lines = [
-    ['NEEDS', needsLen, needsLen > 0 ? 'danger' : 'ok'],
-    ['HIDDEN', hidden, hidden > 0 ? 'warn' : 'faint'],
-    ['FLIGHT', flightLen, flightLen > 0 ? 'accent' : 'faint'],
-    ['WAIT', waitingLen, waitingLen > 0 ? 'warn' : 'faint'],
-    ['JOBS', jobsLen, jobsLen > 0 ? 'accent' : 'faint'],
-    ['SCAN', age, fresh ? 'ok' : 'warn'],
+    ['NEEDS', cell(needsLen), needsLen === null ? 'faint' : needsLen > 0 ? 'danger' : 'ok'],
+    ['HIDDEN', cell(hidden), hidden === null ? 'faint' : hidden > 0 ? 'warn' : 'faint'],
+    ['FLIGHT', cell(flightLen), flightLen === null ? 'faint' : flightLen > 0 ? 'accent' : 'faint'],
+    ['WAIT', cell(waitingLen), waitingLen === null ? 'faint' : waitingLen > 0 ? 'warn' : 'faint'],
+    ['JOBS', cell(jobsLen), jobsLen === null ? 'faint' : jobsLen > 0 ? 'accent' : 'faint'],
+    // scannedAt of 0 / null means no probe has ever run: faint em-dash, not a
+    // stale-looking warn (a failed probe is never a measured value).
+    ['SCAN', age, scannedAt !== null && scannedAt > 0 ? (fresh ? 'ok' : 'warn') : 'faint'],
     ['SKIN', hdaySkinLabel(skin), 'accent']
   ];
 
@@ -9646,7 +9863,7 @@ function hdaySkinCss(paletteCss) {
     '.hday-root .hday-hud-band{position:absolute;left:0;right:0;top:0;height:16%;pointer-events:none;'
       + 'background:linear-gradient(to bottom,transparent,'
       + 'color-mix(in srgb,var(--hday-accent,var(--ui-accent)) 10%,transparent),transparent);'
-      + 'animation:hday-scan-sweep 7.5s linear infinite}',
+      + 'animation:hday-hud-scan-sweep 7.5s linear infinite}',
     '.hday-root .hday-hud-band[data-still="1"]{display:none}',
     // vignette
     '.hday-root .hday-hud-vignette{position:absolute;inset:0;pointer-events:none;'
@@ -9673,13 +9890,16 @@ function hdaySkinCss(paletteCss) {
     '.hday-root .hday-hud-signal{position:absolute;left:16px;bottom:5px;display:flex;align-items:center;'
       + 'gap:.5rem;pointer-events:none}',
     '.hday-root .hday-sig-track{display:flex;gap:3px}',
+    // un-probed signal state renders visibly idle instead of a calm full row
+    '.hday-root .hday-hud-signal[data-known="0"] .hday-sig-track{opacity:.45}',
+    '.hday-root .hday-sig-count.hday-sig-idle{color:var(--hday-ink-3,var(--ui-text-tertiary))}',
     '.hday-root .hday-sig-block{width:13px;height:4px;border-radius:2px;'
       + 'background:var(--hday-line,var(--ui-stroke-secondary));opacity:.5}',
     '.hday-root .hday-sig-block[data-on="1"]{opacity:1;background:var(--hday-danger,var(--ui-accent));'
       + 'box-shadow:0 0 5px var(--hday-glow,var(--ui-accent))}',
     '.hday-root .hday-sig-track[data-calm="1"] .hday-sig-block[data-on="1"]{background:var(--hday-ok,var(--ui-accent));'
       + 'box-shadow:none}',
-    '.hday-root .hday-sig-track[data-hot="1"]{animation:hday-sig-pulse 1.8s ease-in-out infinite}',
+    '.hday-root .hday-sig-track[data-hot="1"]{animation:hday-hud-sig-pulse 1.8s ease-in-out infinite}',
     '.hday-root .hday-sig-count{font-size:.62rem;letter-spacing:.08em;font-variant-numeric:tabular-nums;'
       + 'color:var(--hday-ink-2,var(--ui-text-secondary))}',
     // chips (shared look): KEYMAP bottom-left, SKIN bottom-right
@@ -9702,7 +9922,7 @@ function hdaySkinCss(paletteCss) {
       + 'border-radius:6px;padding:.7rem .8rem .75rem;'
       + 'background:color-mix(in srgb,var(--hday-canvas,var(--ui-bg-primary)) 95%,transparent);'
       + 'box-shadow:0 12px 30px color-mix(in srgb,var(--hday-ink,var(--ui-text-primary)) 16%,transparent);'
-      + 'animation:hday-cheat-in .16s ease-out both}',
+      + 'animation:hday-hud-cheat-in .16s ease-out both}',
     '.hday-root .hday-keymap-title{display:flex;justify-content:space-between;gap:.6rem;font-size:.58rem;'
       + 'letter-spacing:.12em;text-transform:uppercase;color:var(--hday-ink-3,var(--ui-text-tertiary));'
       + 'margin-bottom:.5rem}',
@@ -9735,9 +9955,9 @@ function hdaySkinCss(paletteCss) {
     '.hday-root[data-hday-boot="1"] .hday-stat:nth-child(6){animation-delay:300ms}',
     '.hday-root[data-hday-boot="1"] .hday-stat:nth-child(7){animation-delay:360ms}',
     '.hday-root[data-hday-boot="1"] .hday-stat:nth-child(8){animation-delay:420ms}',
-    '@keyframes hday-scan-sweep{0%{transform:translateY(-120%)}100%{transform:translateY(760%)}}',
-    '@keyframes hday-sig-pulse{0%,100%{opacity:1}50%{opacity:.55}}',
-    '@keyframes hday-cheat-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}',
+    '@keyframes hday-hud-scan-sweep{0%{transform:translateY(-120%)}100%{transform:translateY(760%)}}',
+    '@keyframes hday-hud-sig-pulse{0%,100%{opacity:1}50%{opacity:.55}}',
+    '@keyframes hday-hud-cheat-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}',
     '@keyframes hday-hud-boot{0%{transform:translateY(-60%);opacity:0}30%{opacity:1}'
       + '100%{transform:translateY(320%);opacity:0}}',
     '@keyframes hday-boot-in{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}',
@@ -9747,6 +9967,11 @@ function hdaySkinCss(paletteCss) {
     '@media (prefers-reduced-motion:reduce){',
     '.hday-root *{animation-duration:.001s;animation-delay:0s;animation-iteration-count:1;'
       + 'transition-duration:.001s;transition-delay:0s}',
+    // The universal rule above is (0,1,0) and loses to the core
+    // '.hday-shield.hday-degraded' rule (0,2,0), so the degraded shield kept
+    // pulsing under reduced motion. Repeat it scoped under .hday-root: equal
+    // specificity (0,3,0) + later source order wins — no importance flag.
+    '.hday-root .hday-shield.hday-degraded{animation:none}',
     '.hday-root .hday-hud-band,.hday-root .hday-boot-sweep{display:none}',
     '.hday-root .hday-keymap{animation:none}',
     '.hday-root .hday-sig-track{animation:none}',
@@ -9780,7 +10005,6 @@ const HDAY_PANELS = [
   ['escalation-matrix', hdayPanel09],
   ['skin-hud', hdayPanel10],
 ];
-
 /** The toolkit band: every lane's panel, one row per feature. */
 function ToolkitGrid({ scan, cronJobs }) {
   if (!HDAY_PANELS.length) return null;
@@ -9802,11 +10026,9 @@ function ToolkitGrid({ scan, cronJobs }) {
             jsx('div', {
               className: 'mb-1.5 text-[0.6rem] font-semibold uppercase',
               style: { color: C.faint }, children: name }),
-            // F2: the HUD is the only panel that reports counts - hand it the
-            // REAL payloads (null when the query has not landed) so a failed
-            // probe reads as 'no data', never as a confident zero.
             jsx(Comp, Comp === hdayPanel10
-              ? { scan, jobs: cronJobs, hiddenCount: scan ? (scan.hiddenCount || 0) : null,
+              ? { scan: scan || null, jobs: cronJobs || null,
+                  hiddenCount: scan ? (scan.hiddenCount || 0) : null,
                   scannedAt: Date.now() }
               : {}),
           ],
