@@ -50,6 +50,18 @@ def _rows(module, sid):
     return module._SESSIONS[sid]["gate"]
 
 
+def _mandate(module, sid, text="Fix the failing release notes and commit them"):
+    """Record a substantive user request for *sid*.
+
+    The typed gate judges intent against the session's mandate. A session that
+    never recorded a substantive user message has nothing to judge against, so
+    it fails open (``unjudged`` / ``no-mandate``) by design — every test that
+    expects a judgment must therefore start from a session with a mandate. This
+    records one through the real ``_pre_llm_call`` path.
+    """
+    module._pre_llm_call(session_id=sid, user_message=text, platform="cli")
+
+
 # ---------------------------------------------------------------------------
 # the plan's TDD cases
 # ---------------------------------------------------------------------------
@@ -58,6 +70,7 @@ def _rows(module, sid):
 def test_irreversible_on_mandate_passes_with_judged_row(day, monkeypatch):
     """rm -rf build/ is irreversible but on-mandate -> allowed, `judged` row."""
     module, ctx, sid = day
+    _mandate(module, sid)
     _set_judge(module, monkeypatch,
                _judge(irreversible=0.9, outer_scope=0.1, data_egress=0.0,
                       intent_consistent=0.95, blast_radius="workspace"))
@@ -71,6 +84,7 @@ def test_irreversible_on_mandate_passes_with_judged_row(day, monkeypatch):
 
 def test_repeat_action_is_cached_without_a_second_paid_call(day, monkeypatch):
     module, ctx, sid = day
+    _mandate(module, sid)
     calls = []
 
     def judge(a, u, c):
@@ -89,6 +103,7 @@ def test_repeat_action_is_cached_without_a_second_paid_call(day, monkeypatch):
 
 def test_judge_failure_marks_unjudged_and_does_not_block(day, monkeypatch):
     module, ctx, sid = day
+    _mandate(module, sid)
 
     def boom(a, u, c):
         raise TimeoutError("judge timed out")
@@ -104,6 +119,7 @@ def test_judge_failure_marks_unjudged_and_does_not_block(day, monkeypatch):
 def test_no_judge_marks_unjudged_only_when_typed_phase_needed(day, monkeypatch):
     """No key/judge -> `unjudged` on borderline calls, silence on benign ones."""
     module, ctx, sid = day
+    _mandate(module, sid)
     _set_judge(module, monkeypatch, None)
     assert _call(module, sid, "pytest tests/ -q") is None
     assert _rows(module, sid) == [], "benign calls must stay off the ledger"
@@ -151,6 +167,7 @@ def test_benign_commands_never_reach_the_judge(day, monkeypatch):
 
 def test_off_mandate_plus_risk_escalates_to_human(day, monkeypatch):
     module, ctx, sid = day
+    _mandate(module, sid)
     _set_judge(module, monkeypatch,
                _judge(intent_consistent=0.1, irreversible=0.8,
                       blast_radius="workspace"))
@@ -162,6 +179,7 @@ def test_off_mandate_plus_risk_escalates_to_human(day, monkeypatch):
 
 def test_external_blast_on_soft_mandate_escalates(day, monkeypatch):
     module, ctx, sid = day
+    _mandate(module, sid)
     _set_judge(module, monkeypatch,
                _judge(intent_consistent=0.95, data_egress=0.8,
                       blast_radius="external"))
@@ -174,6 +192,7 @@ def test_external_blast_on_soft_mandate_escalates(day, monkeypatch):
 def test_external_blast_with_explicit_mandate_is_allowed(day, monkeypatch):
     """A human 'yes' already recorded this session = an explicit mandate."""
     module, ctx, sid = day
+    _mandate(module, sid)
     module._SESSIONS[sid]["approvals"].append(
         {"cmd": "deploy", "choice": "once", "by": "", "ts": 1.0})
     _set_judge(module, monkeypatch,
@@ -189,6 +208,7 @@ def test_escalation_without_a_reachable_human_blocks(day, monkeypatch):
     """approvals.mode=off / yolo: emitting `approve` would auto-approve, so the
     gate must block instead — same fail-closed rule jev-shield enforces."""
     module, ctx, sid = day
+    _mandate(module, sid)
     _set_judge(module, monkeypatch,
                _judge(intent_consistent=0.1, irreversible=0.9,
                       blast_radius="machine"))
@@ -202,6 +222,7 @@ def test_cached_denial_still_escalates_without_repurchasing(day, monkeypatch):
     """The judgment is cached, never the verdict: a repeated escalated action
     must escalate again without a second paid call."""
     module, ctx, sid = day
+    _mandate(module, sid)
     calls = []
     _set_judge(module, monkeypatch,
                lambda a, u, c: calls.append(a) or
@@ -298,6 +319,7 @@ def test_outer_scope_write_in_untagged_child_meets_the_typed_gate(day, monkeypat
     meets the typed gate: escalated, and blocked only because no human approval
     gate is reachable. The verdict is the gate's, never the lane veto's."""
     module, ctx, sid = day
+    _mandate(module, "lane-untagged", "Document the release and save it to /x/notes.py")
     _fire(ctx, "subagent_start", parent_session_id=sid,
           child_session_id="lane-untagged",
           child_goal="write a file outside the repo")

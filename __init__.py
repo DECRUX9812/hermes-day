@@ -355,7 +355,10 @@ def _new_rec() -> Dict[str, Any]:
             "detail": "", "at": 0.0, "nudges": 0, "snaps": [],
             "approvals": [], "attn": [], "inst_epoch": 0.0,
             "test_digest": {}, "tamper": [], "receipt": {},
-            "ctx_paths": [], "gate": []}   # gate: regex_hit|judged|cached|unjudged
+            "ctx_paths": [], "gate": [],   # gate: regex_hit|judged|cached|unjudged
+            # the FIRST substantive user message — the typed gate's fallback
+            # mandate when the latest turn is only a host notification
+            "mandate_first": ""}
 
 
 def _rec(sid: str) -> Dict[str, Any]:
@@ -1257,6 +1260,12 @@ _GATE_PATH_KEYS = _PATH_KEYS + (
     "directory", "dir", "dest", "destination", "target", "target_path",
     "output", "output_path", "repo_path", "workspace_path")
 
+#: Session id -> resolved workspace root (see ``_gate_root``). The expensive
+#: fallback (git rev-parse on the ambient cwd) is memoized per session; a
+#: session's own recorded ``_root`` always wins and is re-read every call.
+_GATE_ROOTS: Dict[str, str] = {}
+_GATE_ROOTS_MAX = 256
+
 #: Borderline patterns — mirrored from jev-shield's tier-0 screener
 #: (shield_risk._SHELL_PATTERNS). These do NOT decide anything; they only
 #: decide whether a paid judgment is warranted.
@@ -1317,11 +1326,51 @@ _GATE_CREDENTIAL_NAMES = frozenset({
 _GATE_TOKEN_RE = re.compile(r"(?:~|\.{0,2}/)[^\s'\"|;&()<>]*")
 
 
-def _gate_path_classes(path: str) -> list:
+def _gate_root(session_id: str = "") -> str:
+    """The workspace root paths are classified against.
+
+    The SESSION's recorded root (``rec["_root"]`` — set by the snapshotter and
+    the prompt section) is authoritative. The plugin PROCESS cwd is not the
+    agent's workspace: a gateway usually runs elsewhere, so comparing against
+    it classed every write inside the user's own repo ``outside_workspace``
+    (borderline -> paid judgment -> blocked). Falls back to the session's
+    ambient cwd (``agent.runtime_cwd``, the same source ``_promote_instinct``
+    uses), then to the process cwd exactly as before.
+    """
+    sid = str(session_id or "")
+    rec = _SESSIONS.get(sid)
+    if isinstance(rec, dict):
+        root = rec.get("_root")
+        if isinstance(root, str) and root.strip():
+            return root
+    memo = _GATE_ROOTS.get(sid)
+    if memo:
+        return memo
+    root = ""
+    try:
+        from agent.runtime_cwd import resolve_context_cwd
+        cwd = resolve_context_cwd()
+        if cwd:
+            root = _repo_root(str(cwd)) or str(cwd)
+    except Exception:
+        root = ""
+    if not root:
+        root = os.getcwd()
+    _GATE_ROOTS[sid] = root
+    while len(_GATE_ROOTS) > _GATE_ROOTS_MAX:
+        _GATE_ROOTS.pop(next(iter(_GATE_ROOTS)))
+    return root
+
+
+def _gate_path_classes(path: str, root: Optional[str] = None) -> list:
     """``sensitive_path``/``credential_path``/``outside_workspace`` for one
     path-ish token. Bare separators (``/``, ``./``) carry no signal — this is
     the one deliberate deviation from shield_risk, whose tokenizer turns the
-    trailing slash of ``tests/`` into a ``/`` token and over-flags."""
+    trailing slash of ``tests/`` into a ``/`` token and over-flags.
+
+    ``root`` is the workspace to judge against — callers with a session pass
+    ``_gate_root(session_id)``; without one this stays the process cwd.
+    """
     text = str(path or "").strip().strip("\"'")
     if not text.strip("/. ~"):
         return []
@@ -1332,36 +1381,49 @@ def _gate_path_classes(path: str) -> list:
     base = os.path.basename(lowered.rstrip("/"))
     if base in _GATE_CREDENTIAL_NAMES or base.startswith(".env"):
         classes.append("credential_path")
+    root_abs = os.path.abspath(root or os.getcwd())
     if text.startswith("~") or os.path.isabs(text):
         target = os.path.abspath(os.path.expanduser(text))
     elif ".." in text.split("/"):
-        target = os.path.abspath(os.path.join(os.getcwd(), text))
+        target = os.path.abspath(os.path.join(root_abs, text))
     else:
         return classes
-    root = os.path.abspath(os.getcwd())
     scratch = os.path.abspath(os.environ.get("TMPDIR", "/tmp"))
-    inside = target == root or target.startswith(root + os.sep)
+    inside = target == root_abs or target.startswith(root_abs + os.sep)
     if not inside and not (target == scratch or target.startswith(scratch + os.sep)):
         classes.append("outside_workspace")
     return classes
 
 
-def _gate_screen(tool_name: str, args: Dict[str, Any]) -> tuple:
+def _gate_screen(tool_name: str, args: Dict[str, Any],
+                 session_id: str = "") -> tuple:
     """The free pre-filter in front of the paid typed gate: borderline /
-    irreversible / outer-scope signal classes, or ``()`` for clean."""
+    irreversible / outer-scope signal classes, or ``()`` for clean.
+
+    Paths are classified against the SESSION's workspace root (``_gate_root``),
+    never the plugin process cwd.
+    """
     classes: list = []
     if tool_name in _GATE_SHELL_TOOLS:
         cmd = str(args.get("command") or args.get("cmd") or args.get("code") or "")
         for klass, patterns in _GATE_CMD_PATTERNS:
             if any(re.search(p, cmd, re.I) for p in patterns):
                 classes.append(klass)
-        for token in _GATE_TOKEN_RE.findall(cmd):
-            if "/" in token:
-                classes.extend(_gate_path_classes(token))
+        for match in _GATE_TOKEN_RE.finditer(cmd):
+            raw = match.group(0)
+            if "/" not in raw:
+                continue
+            before = cmd[match.start() - 1] if match.start() else ""
+            if before and (before.isalnum() or before in "._-"):
+                # Mid-word match: the raw text is the tail of a RELATIVE path
+                # ("grep x tests/foo.py" -> "/foo.py"). Relative paths live in
+                # the workspace, so they carry no outer-scope signal.
+                continue
+            classes.extend(_gate_path_classes(raw, _gate_root(session_id)))
     for key in _GATE_PATH_KEYS:
         value = args.get(key)
         if isinstance(value, str) and value:
-            classes.extend(_gate_path_classes(value))
+            classes.extend(_gate_path_classes(value, _gate_root(session_id)))
     try:
         blob = json.dumps(args, default=str)
     except Exception:
@@ -1561,10 +1623,19 @@ def _typed_gate(tool_name: str, args: Dict[str, Any],
 
     with _LOCK:
         rec = _rec(sid)
-        request = str(rec.get("user_request") or "")
+        request = str(rec.get("user_request") or rec.get("mandate_first") or "")
         platform = str(rec.get("platform") or "")
         mandate = _mandate_explicit(rec)
-    ctx: Dict[str, Any] = {"args": dict(args), "workspace": os.getcwd(),
+    if not request.strip():
+        # No substantive user message this session — host notifications
+        # ([System: ...], delegation batch completions, background-process
+        # notices) are not a mandate. There is nothing to judge intent against,
+        # so the off-mandate axis must not fire: fail open, loudly, marked.
+        _gate_log(sid, tool_name, args, {"kind": "unjudged"}, True,
+                  "no-mandate: no substantive user request recorded this "
+                  "session — fail-open (no off-mandate judgment)")
+        return None
+    ctx: Dict[str, Any] = {"args": dict(args), "workspace": _gate_root(sid),
                            "platform": platform, "mandate_explicit": mandate}
     cmd = str(args.get("command") or args.get("code") or "")
     if cmd:
@@ -1670,7 +1741,7 @@ def _pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
             return _block(session_id, tool_name, reason, rule, args)
         # phase 2 — the typed gate sits BEHIND the free deny-list and only
         # pays for judgment when the action could be irreversible/outer-scope
-        screen = _gate_screen(tool_name, args) if _enabled("typed") else ()
+        screen = _gate_screen(tool_name, args, session_id) if _enabled("typed") else ()
         if screen:
             return _typed_gate(tool_name, args, session_id, screen)
         return None
@@ -2557,6 +2628,32 @@ def _api_request_error(session_id: str = "", provider: str = "", model: str = ""
         pass
 
 
+#: Host/system notices delivered as user messages. They are not the user's
+#: mandate: recording one makes the typed gate judge every later action
+#: off-mandate (intent_consistent ~0.25) and — with no reachable approval path
+#: — block it.
+_SYSTEM_MESSAGE_MARKERS = (
+    "[async delegation",
+    "[important: background process",
+    "[system:",
+    "[hermes day evidence gate",
+    "[out-of-band user message",
+)
+#: Anything shorter is an acknowledgement ("ok", "go on"), not a mandate.
+_MANDATE_MIN_CHARS = 12
+
+
+def _is_substantive_message(text: Any) -> bool:
+    """Is *text* the user's own words — usable as the mandate / vacuum goal?"""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if len(stripped) < _MANDATE_MIN_CHARS:
+        return False
+    lowered = stripped.lower()
+    return not any(lowered.startswith(marker) for marker in _SYSTEM_MESSAGE_MARKERS)
+
+
 def _pre_llm_call(session_id: str = "", user_message: str = "",
                   conversation_history: Optional[list] = None,
                   is_first_turn: bool = False, platform: str = "",
@@ -2571,14 +2668,19 @@ def _pre_llm_call(session_id: str = "", user_message: str = "",
     try:
         # The armed vacuum scores chunks against "the current goal"; the typed
         # gate judges intent_consistent against "user_request". Both are the
-        # user's own words — the latest user message — recorded for every
-        # session, independent of the instincts feature flag.
+        # user's own words — the latest SUBSTANTIVE user message — recorded for
+        # every session, independent of the instincts feature flag. Host
+        # notifications arrive as user messages too, and recording one as the
+        # mandate made the typed gate judge every later action off-mandate.
         if session_id and (user_message or platform):
             with _LOCK:
                 rec = _rec(session_id)
-                if isinstance(user_message, str) and user_message.strip():
+                if _is_substantive_message(user_message):
+                    text = str(user_message).strip()[:800]
                     rec["goal"] = _brief(user_message, 800)
-                    rec["user_request"] = str(user_message)[:800]
+                    rec["user_request"] = text
+                    if not rec.get("mandate_first"):
+                        rec["mandate_first"] = text
                 if platform:
                     rec["platform"] = str(platform)
         if not _enabled("instincts"):
