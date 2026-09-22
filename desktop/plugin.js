@@ -144,6 +144,9 @@ const PROMPTS_KEY = 'prompts.v1'
 const DEFAULT_PROMPTS = ['Summarize overnight logs', 'Review my open PRs', 'Check cron results']
 
 let stylesInjected = false
+// lane 10 palette - sentinel block copied verbatim from patches/10-skin-hud.py
+const SKIN_COLOR_CSS = '/* == hday-skin:COLORS BEGIN == */\n/* --- base tokens: skin "current" (default). Values are the plugin\'s own C\n       palette, so pre-existing UI and skin "current" agree exactly. */\n.hday-root{--hday-canvas:#0b0c10;--hday-surface:#161922;--hday-surface-2:#1a1d26;--hday-line:#262a33;\n--hday-line-hot:#333a47;--hday-ink:#f3f4f6;--hday-ink-2:#94a3b8;--hday-ink-3:#64748b;\n--hday-accent:#38bdf8;--hday-ok:#34d399;--hday-warn:#f59e0b;--hday-danger:#ef4444;\n--hday-slate:#8b949e;--hday-kind-input:#c084fc;--hday-glow:#38bdf8;--hday-scan-alpha:18%}\n\n/* --- skin "current" re-declared under its attribute selector, same values:\n       an explicit choice must be identical to the base, never a drift. */\n.hday-root[data-hday-skin="current"]{--hday-canvas:#0b0c10;--hday-surface:#161922;--hday-surface-2:#1a1d26;--hday-line:#262a33;\n--hday-line-hot:#333a47;--hday-ink:#f3f4f6;--hday-ink-2:#94a3b8;--hday-ink-3:#64748b;\n--hday-accent:#38bdf8;--hday-ok:#34d399;--hday-warn:#f59e0b;--hday-danger:#ef4444;\n--hday-slate:#8b949e;--hday-kind-input:#c084fc;--hday-glow:#38bdf8;--hday-scan-alpha:18%}\n\n/* --- skin "phosphor": CRT green. Only hexes from the phosphor candidate\n       list (accents + danger). Surfaces, warn, slate, ink-3 inherit base —\n       re-declaring them would need a hex outside the candidate list. */\n.hday-root[data-hday-skin="phosphor"]{--hday-ink:#8fffce;--hday-ink-2:#7dffbc;--hday-accent:#33ff77;--hday-glow:#33ff77;\n--hday-ok:#4dff9e;--hday-danger:#ff5252;--hday-kind-input:#7dffbc;--hday-scan-alpha:30%}\n\n/* --- skin "oxide": amber/red rust. Surfaces + accents from the oxide\n       candidate list; ok/slate/ink/ink-3 inherit base. */\n.hday-root[data-hday-skin="oxide"]{--hday-canvas:#140d0b;--hday-surface:#1c1210;--hday-surface-2:#241714;--hday-line:#38231c;\n--hday-line-hot:#4a2f25;--hday-accent:#ff8c42;--hday-glow:#ff8c42;--hday-warn:#ffab70;\n--hday-danger:#e2483f;--hday-ink-2:#ffb98a;--hday-kind-input:#ff9a5c;--hday-scan-alpha:22%}\n/* == hday-skin:COLORS END == */'
+
 function ensureDayStyles() {
   if (stylesInjected || typeof document === 'undefined') return
   stylesInjected = true
@@ -206,6 +209,11 @@ function ensureDayStyles() {
       'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.66rem;line-height:1.55}' +
     '.hday-receipt-row{display:flex;gap:.5rem;justify-content:space-between}' +
     '.hday-receipt-sep{border-top:1px dashed currentColor;opacity:.35;margin:.35rem 0}'
+  // F1: hand the sentinel palette to the CSS text builder (hoisted decl)
+  if (typeof SKIN_COLOR_CSS === 'string' && SKIN_COLOR_CSS) {
+    const skin = hdaySkinCss(SKIN_COLOR_CSS)
+    if (skin) el.textContent += skin
+  }
   document.head.appendChild(el)
 }
 
@@ -846,6 +854,7 @@ function Spark({ seqs }) {
 function NeedsYouCard({ item, selected, longest }) {
   const [busy, setBusy] = useState('')
   const [failed, setFailed] = useState('')
+  const reducedRM = hdayUseReducedMotion()  // F3: unconditional hook call
 
   const run = useCallback(
     async (tag, fn) => {
@@ -907,7 +916,7 @@ function NeedsYouCard({ item, selected, longest }) {
       background: C.surface,
       border: `1px solid ${C.border}`,
       borderLeft: `2px solid ${accent.color}`,
-      ...(stale ? { animation: 'hday-stale 2.4s ease-in-out infinite' } : null),
+      ...(stale && !reducedRM ? { animation: 'hday-stale 2.4s ease-in-out infinite' } : null),
       ...(selected ? { boxShadow: `0 0 0 1px ${accent.color}66` } : null)
     },
     children: [
@@ -9773,7 +9782,7 @@ const HDAY_PANELS = [
 ];
 
 /** The toolkit band: every lane's panel, one row per feature. */
-function ToolkitGrid({ }) {
+function ToolkitGrid({ scan, cronJobs }) {
   if (!HDAY_PANELS.length) return null;
   return jsxs('div', { className: 'flex flex-col gap-4',
     children: [
@@ -9793,7 +9802,13 @@ function ToolkitGrid({ }) {
             jsx('div', {
               className: 'mb-1.5 text-[0.6rem] font-semibold uppercase',
               style: { color: C.faint }, children: name }),
-            jsx(Comp, {}),
+            // F2: the HUD is the only panel that reports counts - hand it the
+            // REAL payloads (null when the query has not landed) so a failed
+            // probe reads as 'no data', never as a confident zero.
+            jsx(Comp, Comp === hdayPanel10
+              ? { scan, jobs: cronJobs, hiddenCount: scan ? (scan.hiddenCount || 0) : null,
+                  scannedAt: Date.now() }
+              : {}),
           ],
         }, name)),
     ],
@@ -9810,6 +9825,7 @@ function DayPage() {
   const [celebrate, setCelebrate] = useState(false)
   const [focus, setFocus] = useState(false)
   const [instOpen, setInstOpen] = useState(false)
+  const reducedRM = hdayUseReducedMotion()  // F3
   const prevNeeds = useRef(null)
   const pinnedMap = useValue($pinned)
   const undo = useValue($undo)
@@ -9936,7 +9952,7 @@ function DayPage() {
       '--ui-text-tertiary': C.faint
     },
     children: [
-      celebrate ? jsx(Confetti, { onDone: () => setCelebrate(false) }) : null,
+      celebrate && !reducedRM ? jsx(Confetti, { onDone: () => setCelebrate(false) }) : null,
       jsxs('header', {
         className: 'flex shrink-0 items-center justify-between gap-4 px-6 py-4',
         style: { borderBottom: `1px solid ${C.border}` },
@@ -10206,7 +10222,7 @@ function DayPage() {
                           ]
                         })
                       : null,
-                    jsx(ToolkitGrid, {}),
+                    jsx(ToolkitGrid, { scan: scan.data || null, cronJobs: cron.data ? cron.data.jobs : null }),
                     jsx('div', {
                       className: 'px-2 pt-2 text-[0.68rem]',
                       style: { borderTop: `1px solid ${C.border}`, color: C.faint },

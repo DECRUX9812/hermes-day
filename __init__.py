@@ -1594,10 +1594,18 @@ def _digest_tests(root: str) -> Dict[str, Dict[str, int]]:
 
 
 def _capture_test_digest(rec: Dict[str, Any], root: str) -> None:
-    """Take the baseline once per session, at the first observed mutation."""
+    """Take the baseline once per session, at the first observed mutation.
+
+    Record the root beside the baseline: the digest's keys are *relative to it*,
+    so re-reading them under a different root (or none) reports every file as
+    "removed" — an accusation of tampering that a genuinely green run cannot
+    clear, because ``pre_verify`` short-circuits on ``tamper`` before it ever
+    looks at the exit code.
+    """
     if rec.get("test_digest") or not root:
         return
     rec["test_digest"] = _digest_tests(root)
+    rec["test_digest_root"] = root
 
 
 def _digest_regressions(rec: Dict[str, Any]) -> list:
@@ -1605,7 +1613,24 @@ def _digest_regressions(rec: Dict[str, Any]) -> list:
     base = rec.get("test_digest") or {}
     if not base:
         return []
-    now = _digest_tests(rec.get("_root") or "")
+    # Prefer the root the baseline was captured under. Legacy records only carry
+    # `_root`; adopt it solely when it still contains *every* baseline file,
+    # which proves it is the same tree — a different repo that also has tests/
+    # is indistinguishable from wholesale deletion, so say nothing rather than
+    # accuse. A root that is missing or no longer a directory is not scannable,
+    # and "no scan" is never evidence of deletion.
+    root = rec.get("test_digest_root")
+    if not root:
+        cand = rec.get("_root") or ""
+        if not os.path.isdir(cand):
+            return []
+        probe = _digest_tests(cand)
+        if not all(k in probe for k in base):
+            return []
+        root = rec["test_digest_root"] = cand
+    if not os.path.isdir(root):
+        return []
+    now = _digest_tests(root)
     weak = []
     for rel, was in base.items():
         cur = now.get(rel)
