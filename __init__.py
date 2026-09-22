@@ -55,7 +55,12 @@ Companion to the desktop cockpit (``desktop/plugin.js``). Registers:
   trap learned mid-session could not otherwise reach the running agent; this
   returns the newly-promoted set into the turn's user message (never the
   system prompt, which would break the prompt cache) and only when something
-  genuinely new landed.
+  genuinely new landed. A second producer on the same hook injects
+  conditional context: the ``GOTCHAS.md`` of each directory whose files enter
+  the session's context, once per directory per session, capped at 60 lines
+  with a size receipt; and — only when ``gate.tool_router`` is set — an
+  advisory naming the tool groups the task likely needs (advisory only:
+  deferred tools stay reachable through ``tool_search``).
 - ``/day-approvals`` — the approval ledger (counts, stalls, denies, latency).
 - ``/day-attention`` — interruptions, provider errors, failed subagents.
 - ``/day-guard`` — guard self-test. Replays known-bad and known-benign commands
@@ -90,6 +95,21 @@ import tempfile
 import threading
 import time
 from typing import Any, Dict, Optional
+
+try:  # package-relative when Hermes loads this as hermes_plugins.<slug>
+    from . import hday_gotchas as _gotchas_mod
+    from . import hday_router as _router_mod
+except Exception:  # standalone load — tests exec __init__.py as a bare module
+    try:
+        import hday_gotchas as _gotchas_mod  # type: ignore[no-redef]
+    except Exception:
+        _gotchas_mod = None
+    try:
+        import hday_router as _router_mod  # type: ignore[no-redef]
+    except Exception:
+        _router_mod = None
+
+_GOTCHAS_MAX = getattr(_gotchas_mod, "MAX_SECTION_LINES", 60)
 
 _STATE_KEY = "sessions"
 _INDEX_KEY = "instinct_index"   # ctx.state key: {"repos": [repo_root, ...]}
@@ -266,7 +286,8 @@ def _new_rec() -> Dict[str, Any]:
     return {"files": [], "runs": [], "blocks": [], "verdict": None,
             "detail": "", "at": 0.0, "nudges": 0, "snaps": [],
             "approvals": [], "attn": [], "inst_epoch": 0.0,
-            "test_digest": {}, "tamper": [], "receipt": {}}
+            "test_digest": {}, "tamper": [], "receipt": {},
+            "ctx_paths": []}
 
 
 def _rec(sid: str) -> Dict[str, Any]:
@@ -446,6 +467,171 @@ def _instincts_section(session_info: Dict[str, Any]) -> str:
         return _instincts_block(str(info.get("cwd") or ""))
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Conditional context — per-directory GOTCHAS.md, injected once per directory
+# (Phase 4), plus the tool-group router advisory (Phase 3, flag-gated)
+# ---------------------------------------------------------------------------
+
+_GOTCHAS_CACHE: Dict[str, Dict[str, str]] = {}  # repo_root -> discovered map
+_GOTCHAS_CACHE_MAX = 32                          # roots, not files
+_FILE_ROOT: Dict[str, Optional[str]] = {}        # abspath -> repo root, memoized
+
+
+def _memo_repo_root(path: str) -> Optional[str]:
+    """``_repo_root`` memoized — the pre_llm_call path cannot afford a git
+    subprocess per touched file per turn."""
+    if path in _FILE_ROOT:
+        return _FILE_ROOT[path]
+    root = _repo_root(path)
+    if len(_FILE_ROOT) > 500:
+        _FILE_ROOT.clear()
+    _FILE_ROOT[path] = root
+    return root
+
+
+def _discover_gotchas(root: str) -> Dict[str, str]:
+    """Bounded discovery: once per repo root per process, cache-capped."""
+    if root not in _GOTCHAS_CACHE:
+        if len(_GOTCHAS_CACHE) >= _GOTCHAS_CACHE_MAX:
+            return {}
+        _GOTCHAS_CACHE[root] = _gotchas_mod.discover(root) if _gotchas_mod else {}
+    return _GOTCHAS_CACHE[root]
+
+
+def _gotchas_inject(rec: Dict[str, Any]) -> Optional[str]:
+    """The GOTCHAS.md block for directories newly touched by this session.
+
+    Each directory's section is injected at most once per session — it is
+    standing context, and re-sending it every turn would tax every subsequent
+    request. A directory dropped by the 60-line cap was never seen and stays
+    eligible for a later turn. Precedence (carried in the block's header):
+    instincts > gotchas > skills.
+    """
+    if _gotchas_mod is None or not _enabled("gotchas"):
+        return None
+    with _LOCK:
+        paths = [p for p in list(rec.get("ctx_paths") or [])
+                 + list(rec.get("files") or []) if isinstance(p, str) and p]
+        seen = set(rec.get("gotchas_seen") or [])
+    if not paths:
+        return None
+    # outside the lock: memoized git lookups + the (cached) repo walk
+    roots: Dict[str, list] = {}
+    for p in paths:
+        root = _memo_repo_root(p)
+        if root:
+            roots.setdefault(root, []).append(p)
+    keys, sections = [], []
+    for root in sorted(roots):
+        discovered = _discover_gotchas(root)
+        if not discovered:
+            continue
+        rels = []
+        for p in roots[root]:
+            try:
+                rels.append(os.path.relpath(p, root))
+            except ValueError:
+                pass
+        for d, text in _gotchas_mod.sections_for(rels, discovered):
+            key = root + "\x00" + d
+            if key not in seen:
+                keys.append(key)
+                sections.append((d, text))
+    block = _gotchas_mod.build_section(sections) if sections else None
+    if not block:
+        return None
+    with _LOCK:
+        # only sections that survived the cap count as injected
+        seen = set(rec.get("gotchas_seen") or [])
+        seen.update(k for k, (d, _t) in zip(keys, sections)
+                    if f"In {d or os.curdir} (" in block)
+        rec["gotchas_seen"] = sorted(seen)
+    n = len(block.splitlines())
+    return (block + f"\n# hermes-day gotchas receipt: {n} lines injected "
+            f"(cap {_GOTCHAS_MAX}); once per directory per session")
+
+
+_TOOL_CATALOG: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def _tool_catalog() -> Dict[str, Dict[str, str]]:
+    """group -> {tool: one-liner} from the live registry's resolved toolset.
+
+    Read-only and lazy; returns {} whenever the agent internals are not
+    reachable (tests, partial installs). Advisory only — it never gates a
+    tool's reachability.
+    """
+    global _TOOL_CATALOG
+    if _TOOL_CATALOG is not None:
+        return _TOOL_CATALOG
+    catalog: Dict[str, Dict[str, str]] = {}
+    try:
+        import model_tools
+        from tools.registry import registry
+        for name in list(getattr(model_tools, "_last_resolved_tool_names",
+                                 None) or []):
+            entry = registry.get_entry(name)
+            group = getattr(entry, "toolset", None) or "other"
+            if group.startswith("mcp-"):
+                group = group[4:]
+            schema = getattr(entry, "schema", None) or {}
+            desc = str(((schema.get("function") or schema).get("description")
+                        or "")).split("\n", 1)[0].strip()[:80]
+            catalog.setdefault(group, {})[name] = desc
+    except Exception:
+        catalog = {}
+    if catalog:
+        _TOOL_CATALOG = catalog
+    return catalog
+
+
+def _router_advisory(rec: Optional[Dict[str, Any]], user_message: Any) -> Optional[str]:
+    """Phase 3 wiring — name the tool groups the task most likely needs.
+
+    The plugin API has no tool-schema surface (no hook can alter what is
+    sent), so this can only advise, never hide: deferred tools stay reachable
+    through tool_search regardless. Off unless ``gate.tool_router`` is set.
+    """
+    if _router_mod is None or not _flag("tool_router", False):
+        return None
+    task = str(user_message or "").strip()
+    if not task:
+        return None
+    pick = _router_mod.suggest(task, _tool_catalog())
+    if not pick.groups:
+        return None
+    joined = ", ".join(pick.groups)
+    if rec is not None:
+        with _LOCK:
+            if rec.get("router_last") == joined:
+                return None
+            rec["router_last"] = joined
+    return ("[Hermes Day — tool router, advisory] likely tool groups for this "
+            f"task: {joined}. Everything else stays reachable via tool_search.")
+
+
+def _pre_llm_call_sections(session_id: str = "", user_message: str = "",
+                           **_kw: Any) -> Optional[str]:
+    """Second producer on the pre_llm_call injection point: conditional
+    GOTCHAS sections and (flagged) the router advisory. The host appends the
+    return value to the turn's user message — never the frozen system prompt.
+    """
+    try:
+        with _LOCK:
+            rec = _SESSIONS.get(session_id or "")
+        parts = []
+        if rec is not None:
+            block = _gotchas_inject(rec)
+            if block:
+                parts.append(block)
+        advisory = _router_advisory(rec, user_message)
+        if advisory:
+            parts.append(advisory)
+        return "\n\n".join(parts) or None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1004,6 +1190,13 @@ def _post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
             failed_edit = False
         with _LOCK:
             rec = _rec(session_id)
+            # every path-carrying call (read or write) puts a file into
+            # context — feed the conditional-GOTCHAS injector, capped.
+            cpath = next((str(args.get(k) or "") for k in _PATH_KEYS
+                          if args.get(k)), "")
+            if cpath and cpath not in rec["ctx_paths"]:
+                rec["ctx_paths"].append(cpath)
+                del rec["ctx_paths"][: max(0, len(rec["ctx_paths"]) - 60)]
             # credential watch runs on every tool result, not just terminal
             signs = _secret_signs(_result_text(result))
             if signs:
@@ -1980,6 +2173,20 @@ def _enabled(section: str) -> bool:
     return True
 
 
+def _flag(section: str, default: bool) -> bool:
+    """``gate.<section>`` with an explicit default — for surfaces that must
+    ship OFF unless the operator opts in (``tool_router``)."""
+    if _CTX is None:
+        return default
+    try:
+        cfg = _CTX.get_config("gate")
+        if isinstance(cfg, dict) and section in cfg:
+            return bool(cfg[section])
+    except Exception:
+        pass
+    return default
+
+
 def register(ctx: Any) -> None:
     global _CTX
     _CTX = ctx
@@ -1998,6 +2205,7 @@ def register(ctx: Any) -> None:
         ("subagent_stop", _subagent_stop),
         ("api_request_error", _api_request_error),
         ("pre_llm_call", _pre_llm_call),
+        ("pre_llm_call", _pre_llm_call_sections),
     ):
         try:
             ctx.register_hook(_hook, _fn)
