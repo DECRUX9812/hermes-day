@@ -59,6 +59,14 @@ Companion to the desktop cockpit (``desktop/plugin.js``). Registers:
   through the real predicates so a silently-dead gate (or one that has started
   over-blocking) surfaces as DEGRADED instead of an absence of protection.
   ``/day-evidence`` carries the same under ``guard``.
+- Shared repo manifest — ``hday_manifest`` walks the repo ONCE per staleness
+  window and every read-only background lane consumes that single build:
+  ``_manifest_lane_context`` returns the JSON a ``delegate_task`` child
+  carries in ``context`` (the walk is persisted to ``<repo>/.hermes/
+  manifest.json`` so later children reuse it instead of re-walking). A child
+  spawned with the payload's ``goal_prefix`` in its goal is marked read-only
+  via ``subagent_start``, and ``pre_tool_call`` vetoes its write attempts.
+  ``/day-manifest`` inspects the per-repo build ledger.
 - Rollback insurance — ``/day-rollback`` snapshots the current state first, so
   a rollback is itself reversible rather than a one-way door.
 - Test-integrity digest — a fingerprint of the suite taken at the first observed
@@ -80,6 +88,7 @@ State: per-session records in ``ctx.state`` under the ``sessions`` key
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -87,6 +96,8 @@ import tempfile
 import threading
 import time
 from typing import Any, Dict, Optional
+
+_log = logging.getLogger("hday")
 
 _STATE_KEY = "sessions"
 _INDEX_KEY = "instinct_index"   # ctx.state key: {"repos": [repo_root, ...]}
@@ -599,8 +610,9 @@ def _call_preview(tool_name: str, args: Dict[str, Any]) -> str:
 
 
 def _block(sid: str, tool_name: str, reason: str, rule: str = "Honesty Guard",
-           args: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
-    message = (
+           args: Optional[Dict[str, Any]] = None,
+           message: Optional[str] = None) -> Dict[str, str]:
+    message = message or (
         f"Hermes Day honesty guard BLOCKED this call — it {reason}. Tests and checks are "
         "evidence, not decoration: fix the implementation or ask the human, do not modify, "
         "delete, or launder the test suite to force a pass."
@@ -683,10 +695,20 @@ def _canary(force: bool = False) -> Dict[str, Any]:
 def _pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
                    session_id: str = "", **_kw: Any) -> Optional[Dict[str, str]]:
     try:
+        args = args if isinstance(args, dict) else {}
+        # Read-only background lanes (delegate_task children spawned with the
+        # manifest lane tag): a write attempt is vetoed outright — reads,
+        # checks and inspection commands still pass through to the guard.
+        if session_id in _READ_ONLY_LANES and _enabled("lanes"):
+            why = _lane_write_attempt(tool_name, args)
+            if why:
+                return _block(session_id, tool_name, why, "Read-Only Lane", args,
+                              message="Hermes Day read-only lane BLOCKED this call — "
+                                      f"{why}. Lane children consume the shared repo "
+                                      "manifest; writes belong to the foreground session.")
         if not _enabled("honesty"):
             return None
         _canary()  # TTL-cached liveness probe for the gate itself
-        args = args if isinstance(args, dict) else {}
         hit = None
         if tool_name == "terminal":
             cmd = str(args.get("command") or args.get("code") or "")
@@ -738,7 +760,7 @@ def _post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         if not _enabled("observe"):
             return
         args = args if isinstance(args, dict) else {}
-        if isinstance(result, str) and "honesty guard BLOCKED" in result:
+        if isinstance(result, str) and "BLOCKED this call" in result:
             return  # vetoed calls echo back as tool results — not evidence
         if status == "error":
             failed_edit = tool_name in _FILE_EDIT_TOOLS
@@ -1409,7 +1431,8 @@ def _agent_loop_stopped(session_key: str = "", platform: str = "",
         pass
 
 
-def _subagent_stop(parent_session_id: str = "", child_role: Optional[str] = None,
+def _subagent_stop(parent_session_id: str = "", child_session_id: Any = None,
+                   child_role: Optional[str] = None,
                    child_summary: Optional[str] = None, child_status: str = "",
                    tool_call_history: Optional[list] = None,
                    duration_ms: int = 0, **_kw: Any) -> None:
@@ -1422,6 +1445,7 @@ def _subagent_stop(parent_session_id: str = "", child_role: Optional[str] = None
         status = child_status or "unknown"
         dur = int(duration_ms or 0)
         with _LOCK:
+            _READ_ONLY_LANES.pop(str(child_session_id or ""), None)
             rec = _rec(parent_session_id)
             tally = rec.setdefault("subagents", {})
             tally[status] = int(tally.get(status) or 0) + 1
@@ -1698,6 +1722,199 @@ def _cmd_guard(arg: str = "") -> str:
     return json.dumps(_canary(force=bool((arg or "").strip())))
 
 
+# ---------------------------------------------------------------------------
+# Shared repo manifest — ONE walk per repo, fanned out to read-only lanes
+#
+# ``hday_manifest`` builds the repo-state manifest; this seam persists it to
+# ``<repo>/.hermes/manifest.json`` and hands the JSON to ``delegate_task``
+# children so N background consumers share ONE walk. A child whose goal starts
+# with ``_LANE_TAG`` is marked read-only when ``subagent_start`` fires, and
+# ``_pre_tool_call`` vetoes its file edits and mutating commands. The veto is
+# heuristic — ``_WRITE_CMD_RE`` + mutating git verbs + the file-edit tool set;
+# a write routed through a non-matching tool or an arbitrary script is the
+# known gap, same class the honesty guard already declares.
+# ---------------------------------------------------------------------------
+
+_LANE_TAG = "[hday-lane:read-only]"
+_LANES_MAX = 256
+_READ_ONLY_LANES: Dict[str, float] = {}   # child session_id -> marked_at
+_MANIFEST_RUNS: Dict[str, Dict[str, Any]] = {}  # repo_root -> build ledger
+_MANIFEST_MOD = None
+
+# git's read verbs (log/diff/status/show) stay legal in a lane; these mutate
+# refs or the worktree. _WRITE_CMD_RE covers shell-level mutation.
+_LANE_GIT_WRITE_RE = re.compile(
+    r"\bgit\s+(?:add|commit|push|pull|checkout|switch|restore|reset|clean|"
+    r"apply|merge|rebase|cherry-pick|revert|rm|mv|init|stash)\b", re.I)
+
+
+def _manifest_mod():
+    """The standalone ``hday_manifest`` module, loaded lazily by path — the
+    plugin dir is not an importable package in production."""
+    global _MANIFEST_MOD
+    if _MANIFEST_MOD is None:
+        try:
+            import hday_manifest as mod  # tests put the repo root on sys.path
+        except Exception:
+            try:
+                import importlib.util as _ilu
+                spec = _ilu.spec_from_file_location(
+                    "hday_manifest",
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "hday_manifest.py"))
+                mod = _ilu.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+            except Exception as exc:
+                _log.warning("hday_manifest unavailable: %s", exc)
+                mod = False
+        _MANIFEST_MOD = mod
+    return _MANIFEST_MOD or None
+
+
+def _manifest_path(root: str) -> str:
+    return os.path.join(root, ".hermes", "manifest.json")
+
+
+def _manifest_lane_context(repo_root: str = "", rebuild: bool = False) -> Dict[str, Any]:
+    """The ONE repo-state manifest, handed to every read-only background lane.
+
+    Builds (and persists under ``<root>/.hermes/manifest.json``) only when no
+    fresh manifest is on disk; later calls inside the module's staleness
+    window reuse that build — the N-consumer fan-out pays for one walk, and
+    the per-repo ledger records ``builds`` vs ``consumers``. The return value
+    is JSON-serializable: drop it (or just ``manifest_path``) into a
+    ``delegate_task`` child's ``context``, and prepend ``goal_prefix`` to the
+    child's ``goal`` so ``subagent_start`` marks the session read-only.
+    """
+    mod = _manifest_mod()
+    if mod is None:
+        return {"ok": False, "error": "hday_manifest module unavailable"}
+    try:
+        base = os.path.abspath(os.path.expanduser(str(repo_root or "") or os.getcwd()))
+        root = _repo_root(base) or base
+        path = _manifest_path(root)
+        built = False
+        with _LOCK:
+            led = _MANIFEST_RUNS.setdefault(
+                root, {"builds": 0, "consumers": 0, "path": path, "built_at": 0.0})
+            manifest, reason = (None, "rebuild") if rebuild else mod.load(path)
+            if manifest is None:
+                manifest = mod.build_manifest(root)
+                built = True
+                led["builds"] += 1
+                led["built_at"] = float(manifest.get("built_at") or 0.0)
+                led["persisted"] = bool(mod.persist(manifest, path))
+                led["miss_reason"] = reason
+            led["consumers"] += 1
+            builds, consumers = led["builds"], led["consumers"]
+        if built:
+            _log.info("hday manifest build for %s: %d files, %d loc "
+                      "(lane consumer #%d, miss=%s)",
+                      root, len(manifest.get("files") or []),
+                      manifest.get("total_loc") or 0, consumers, reason)
+        return {
+            "ok": True,
+            "lane": "read-only",
+            "goal_prefix": _LANE_TAG + " ",
+            "manifest_path": path,
+            "manifest": manifest,
+            "reused": not built,
+            "builds": builds,
+            "consumers": consumers,
+            "rule": ("Read-only background lane: consume this manifest instead "
+                     "of re-walking the repo. File edits and mutating commands "
+                     "are vetoed by the gate."),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _lane_write_attempt(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Why this call is a write attempt in a read-only lane, else None."""
+    if tool_name in _FILE_EDIT_TOOLS:
+        return "a file edit"
+    if tool_name in _VACUUM_TOOLS:  # the terminal-family tool names
+        cmd = str(args.get("command") or args.get("code") or "")
+        if cmd and (_WRITE_CMD_RE.search(cmd) or _LANE_GIT_WRITE_RE.search(cmd)):
+            return f"a mutating command: {cmd[:80]}"
+    return None
+
+
+def _subagent_start(parent_session_id: str = "", child_session_id: Any = None,
+                    child_goal: str = "", **_kw: Any) -> None:
+    """Mark a delegate_task child read-only when its goal carries the lane tag."""
+    try:
+        sid = str(child_session_id or "")
+        if not sid or _LANE_TAG not in str(child_goal or ""):
+            return
+        with _LOCK:
+            if len(_READ_ONLY_LANES) >= _LANES_MAX:
+                oldest = min(_READ_ONLY_LANES, key=_READ_ONLY_LANES.get)
+                _READ_ONLY_LANES.pop(oldest, None)
+            _READ_ONLY_LANES[sid] = time.time()
+    except Exception:
+        pass
+
+
+def _manifest_status(repo_root: str) -> Dict[str, Any]:
+    """Inspect one repo's persisted manifest + its build ledger."""
+    base = os.path.abspath(os.path.expanduser(str(repo_root or "")))
+    root = _repo_root(base) or base
+    path = _manifest_path(root)
+    led = _MANIFEST_RUNS.get(root) or {}
+    state, built_at, files_n, loc = "unknown", None, 0, 0
+    mod = _manifest_mod()
+    if mod is not None:
+        manifest, reason = mod.load(path, stale_after_s=None)
+        if manifest is None:
+            state = reason
+        else:
+            built_at = manifest.get("built_at")
+            files_n = len(manifest.get("files") or [])
+            loc = manifest.get("total_loc") or 0
+            fresh, _why = mod.load(path)  # with the staleness policy applied
+            state = "fresh" if fresh is not None else "stale"
+    return {
+        "root": root, "path": path, "state": state, "built_at": built_at,
+        "age_s": (round(time.time() - built_at, 1)
+                  if isinstance(built_at, (int, float)) else None),
+        "files": files_n, "total_loc": loc,
+        "builds": int(led.get("builds") or 0),
+        "consumers": int(led.get("consumers") or 0),
+        "read_only_lanes": len(_READ_ONLY_LANES),
+    }
+
+
+def _cmd_manifest(arg: str = "") -> str:
+    """``[repo_root] [rebuild|context]`` — shared repo-manifest ledger.
+
+    ``context`` returns the delegate_task hand-off JSON (the manifest inline);
+    ``rebuild`` forces a fresh walk; a bare path or no arg reports status.
+    """
+    try:
+        parts = (arg or "").split()
+        mode = next((p for p in parts if p in ("rebuild", "context")), "")
+        roots = [p for p in parts if p not in ("rebuild", "context")]
+        if roots:
+            root = roots[0]
+            if mode == "context":
+                return json.dumps(_manifest_lane_context(root))
+            if mode == "rebuild":
+                payload = _manifest_lane_context(root, rebuild=True)
+                if not payload.get("ok"):
+                    return json.dumps(payload)
+            return json.dumps({"ok": True, "manifests": [_manifest_status(root)]})
+        known = sorted(_MANIFEST_RUNS) or sorted(
+            {r for r in (rec.get("_root") for rec in _SESSIONS.values()) if r})
+        if not known:
+            return json.dumps({"ok": False, "error":
+                               "usage: day-manifest <repo_root> [rebuild|context]"})
+        return json.dumps({"ok": True,
+                           "manifests": [_manifest_status(r) for r in known]})
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)[:200]})
+
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -1731,6 +1948,7 @@ def register(ctx: Any) -> None:
         ("pre_approval_request", _pre_approval_request),
         ("post_approval_response", _post_approval_response),
         ("agent_loop_stopped", _agent_loop_stopped),
+        ("subagent_start", _subagent_start),
         ("subagent_stop", _subagent_stop),
         ("api_request_error", _api_request_error),
         ("pre_llm_call", _pre_llm_call),
@@ -1791,6 +2009,12 @@ def register(ctx: Any) -> None:
         "day-guard", _cmd_guard,
         description="Honesty-guard self-test: proves the gate blocks and is not over-blocking.",
         args_hint="[force]",
+    )
+    ctx.register_command(
+        "day-manifest", _cmd_manifest,
+        description="Shared repo manifest for read-only background lanes "
+                    "(status, rebuild, or the delegate_task context JSON).",
+        args_hint="[repo_root] [rebuild|context]",
     )
 
     # Feature lanes: one file each under patches/, loaded by path so no import
