@@ -2016,6 +2016,79 @@ function TurnScrubber({ turns, scrub, onScrub, onRevert, reverting, revertNote, 
   })
 }
 
+/* hday:viewmodels-begin */
+// Pure view-models for the decision ledger + X-Ray relevance heat — the typed
+// control plane made legible. No imports, no SDK references: this block is
+// extracted verbatim by tests/test_ledger_view.py and evaluated under node:vm,
+// so it must stay self-contained (return tone names, never palette colors).
+
+const LEDGER_LANES = ['local', 'classifier', 'hosted']
+const LEDGER_STATUSES = ['judged', 'cached', 'unjudged', 'regex_hit']
+
+const _lvNum = v => {
+  // null/''/{} coerce through Number() to 0/NaN — a real zero stays zero, but
+  // an absent field must surface as unknown (null), never a silent zero.
+  if (v === null || v === undefined || v === '') return null
+  if (typeof v === 'boolean' || typeof v === 'object') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+// One ledger row -> the displayed columns. Missing fields are 'unknown'/null —
+// never silently zeroed: an absent ms/cost is shown as '—', an absent kind or
+// lane as 'unknown'.
+function hdayLedgerRow(row, src) {
+  const r = row && typeof row === 'object' ? row : {}
+  const status = LEDGER_STATUSES.includes(r.kind) ? r.kind
+    : LEDGER_STATUSES.includes(r.status) ? r.status : 'unknown'
+  const lane = LEDGER_LANES.includes(r.lane) ? r.lane : 'unknown'
+  let when = _lvNum(r.ts)
+  if (when !== null && when < 1e12) when *= 1000
+  return {
+    src: src || 'unknown',
+    status,
+    lane,
+    ms: _lvNum(r.ms),
+    cost: _lvNum(r.cost),
+    label: String(r.action || r.tool ||
+      (r.chunk !== undefined && r.chunk !== null ? `chunk ${r.chunk}` : '')),
+    reason: String(r.reason || r.rule || ''),
+    allow: typeof r.allow === 'boolean' ? r.allow : null,
+    when
+  }
+}
+
+// Merge the two backend ledgers (gate decisions + ctxscore chunk rows) into
+// display rows, preserving arrival order, plus per-status counts.
+function hdayLedgerView(payload) {
+  const p = payload && typeof payload === 'object' ? payload : {}
+  const gate = Array.isArray(p.gate) ? p.gate : (Array.isArray(p) ? p : [])
+  const ctx = Array.isArray(p.ctxscore) ? p.ctxscore : []
+  const rows = [
+    ...gate.map(r => hdayLedgerRow(r, 'gate')),
+    ...ctx.map(r => hdayLedgerRow(r, 'ctx'))
+  ]
+  const counts = { judged: 0, cached: 0, unjudged: 0, regex_hit: 0, unknown: 0 }
+  for (const r of rows) counts[r.status] = (counts[r.status] || 0) + 1
+  return { rows, counts }
+}
+
+// ctxscore noul -> heat tone for the X-Ray strip. noul absent (unjudged — e.g.
+// no judge wired) is 'unknown', never silently zero.
+function hdayHeatTicks(rows) {
+  const list = Array.isArray(rows) ? rows : []
+  return list.map((row, i) => {
+    const r = row && typeof row === 'object' ? row : {}
+    const noul = _lvNum(r.noul)
+    const heat = noul === null ? null : Math.min(1, Math.max(0, noul))
+    const tone = heat === null ? 'unknown'
+      : heat >= 0.6 ? 'hot' : heat >= 0.35 ? 'warm' : 'cold'
+    return { i, heat, tone,
+      disposition: typeof r.disposition === 'string' ? r.disposition : null }
+  })
+}
+/* hday:viewmodels-end */
+
 // Context X-Ray — rough token split of the session's context, estimated from
 // replay frames (chars/4). sys = prompt base + message bodies, files =
 // read/write/diff tool traffic, dumps = stdout/stderr tool results.
@@ -2044,7 +2117,9 @@ function xrayFromEvents(events) {
 
 const fmtTok = n => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`)
 
-function XrayBar({ events, ev, storedId, route }) {
+const HEAT_TONE = { hot: '#34d399', warm: '#f59e0b', cold: '#ef4444', unknown: '#64748b' }
+
+function XrayBar({ events, ev, storedId, route, heat }) {
   const seg = xrayFromEvents(events)
   const total = seg.sys + seg.files + seg.dumps || 1
   const vac = (ev && ev.vacuum) || null
@@ -2083,6 +2158,29 @@ function XrayBar({ events, ev, storedId, route }) {
           jsx('span', { style: { width: `${Math.max(0, (seg.dumps / total) * 100)}%`, background: C.amber } })
         ]
       }),
+      // relevance heat — one tick per scored context chunk (ctxscore ledger).
+      // Grey = unjudged (no judge wired yet); it never pretends to be a score.
+      heat && heat.length
+        ? jsxs('div', {
+            className: 'mt-1 flex items-center gap-2',
+            children: [
+              jsx('span', { className: 'shrink-0 text-[0.58rem] uppercase tracking-wider', style: { color: C.faint }, children: 'rel' }),
+              jsxs('div', {
+                className: 'flex h-1 min-w-0 flex-1 items-stretch gap-px overflow-hidden rounded-full',
+                style: { background: C.border },
+                children: heat.slice(0, 200).map(t => jsx('span', {
+                  className: 'min-w-[2px] flex-1',
+                  title: `chunk ${t.i}: relevance ${t.heat === null ? 'unjudged' : t.heat.toFixed(2)}${t.disposition ? ` · ${t.disposition}` : ''}`,
+                  style: {
+                    background: HEAT_TONE[t.tone] || HEAT_TONE.unknown,
+                    opacity: t.tone === 'unknown' ? 0.35 : 0.55 + t.heat * 0.45
+                  }
+                }, t.i))
+              }),
+              jsx('span', { className: 'shrink-0 font-mono text-[0.58rem]', style: { color: C.faint }, children: `${heat.filter(t => t.tone !== 'unknown').length}/${heat.length}` })
+            ]
+          })
+        : null,
       jsxs('div', {
         className: 'mt-1 flex items-center gap-2.5 text-[0.58rem]',
         children: [
@@ -2127,14 +2225,27 @@ function InstinctsDrawer({ open, onClose, route }) {
     refetchInterval: 10000,
     staleTime: 4000
   })
+  // whole prompt sections (instincts / gotchas) — toggleable like instincts
+  const sectQ = useQuery({
+    queryKey: ['hday-sections'],
+    queryFn: async () => {
+      const disp = await rpc(route, 'command.dispatch', { name: 'day-sections', arg: '' })
+      const out = disp && (disp.output || disp.text || '')
+      return out && out.trim().startsWith('{') ? JSON.parse(out) : { ok: false }
+    },
+    enabled: open,
+    staleTime: 4000
+  })
   const act = async (name, arg) => {
     try {
       await rpc(route, 'command.dispatch', { name, arg })
       queryClient.invalidateQueries({ queryKey: ['hday-instincts'] })
+      queryClient.invalidateQueries({ queryKey: ['hday-sections'] })
     } catch {}
   }
   if (!open) return null
   const repos = (instQ.data && instQ.data.repos) || {}
+  const sections = (sectQ.data && sectQ.data.sections) || {}
   const roots = Object.keys(repos).sort()
   const totalEnabled = roots.reduce((n, r) => n + repos[r].filter(i => i.enabled !== false).length, 0)
   return jsxs('div', {
@@ -2158,6 +2269,29 @@ function InstinctsDrawer({ open, onClose, route }) {
         children: jsxs('div', {
           className: 'flex flex-col gap-3 p-3',
           children: [
+            Object.keys(sections).length
+              ? jsxs('div', {
+                  className: 'flex flex-col gap-1.5',
+                  children: [
+                    jsx('div', { className: 'text-[0.62rem] font-semibold uppercase tracking-wider', style: { color: C.faint }, children: 'Prompt sections' }),
+                    ...Object.entries(sections).map(([name, s]) => jsxs('div', {
+                      className: 'flex items-center gap-2 rounded border px-2 py-1.5',
+                      style: { borderColor: C.border, background: C.surface, opacity: s.enabled === false ? 0.55 : 1 },
+                      children: [
+                        jsx('button', {
+                          className: 'shrink-0 rounded border',
+                          style: { width: 12, height: 12, borderColor: s.enabled === false ? C.border : C.emerald, background: s.enabled === false ? 'transparent' : C.emerald },
+                          disabled: s.source === 'config',
+                          title: s.source === 'config' ? 'pinned in config.yaml — edit gate.' + name + ' there' : 'toggle this prompt section',
+                          onClick: () => act('day-section-set', `${name} ${s.enabled === false ? 1 : 0}`)
+                        }),
+                        jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.66rem] font-medium', style: { color: C.text }, children: name === 'instincts' ? 'instincts block' : name === 'gotchas' ? 'GOTCHAS.md block' : name }),
+                        jsx('span', { className: 'shrink-0 text-[0.58rem]', style: { color: C.faint }, children: s.source === 'config' ? 'config-pinned' : s.enabled === false ? 'off next session' : 'on next session' })
+                      ]
+                    }, name))
+                  ]
+                })
+              : null,
             instQ.isLoading ? jsxs('div', { className: 'flex items-center gap-2 py-4', style: { color: C.faint }, children: [jsx(Loader, {}), jsx('span', { className: 'text-[0.72rem]', children: 'Loading ledgers…' })] }) : null,
             !instQ.isLoading && !roots.length
               ? jsx('div', { className: 'py-6 text-center text-[0.72rem]', style: { color: C.faint }, children: 'No instincts yet — blocked traps and failed checks promote themselves here automatically.' })
@@ -2201,6 +2335,64 @@ function InstinctsDrawer({ open, onClose, route }) {
           ]
         })
       })
+    ]
+  })
+}
+
+// Decision ledger — every gate/scoring decision the backend recorded for this
+// session: lane, judged-vs-cached-vs-unjudged, cost and latency per gate. Rows
+// come from the hday_gate.decide shadow and hday_ctxscore.score; 'unknown' and
+// '—' mark fields a row never carried, never a silent zero.
+const LEDGER_STATUS_COLOR = {
+  judged: '#34d399',
+  cached: '#58a6ff',
+  unjudged: '#f59e0b',
+  regex_hit: '#ef4444',
+  unknown: '#64748b'
+}
+
+function LedgerView({ data, loading }) {
+  if (loading) return jsxs('div', { className: 'flex items-center gap-2 px-3 py-6', style: { color: C.faint }, children: [jsx(Loader, {}), jsx('span', { className: 'text-[0.72rem]', children: 'Reading decision ledger…' })] })
+  const view = hdayLedgerView(data)
+  if (!view.rows.length) return jsx('div', { className: 'px-3 py-6 text-[0.72rem] leading-5', style: { color: C.faint }, children: 'No gate decisions recorded for this session yet — rows land here as tools fire.' })
+  const cols = 'grid grid-cols-[62px_66px_52px_60px_1fr] items-baseline gap-2 px-1'
+  const summary = Object.entries(view.counts).filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}`).join(' · ')
+  return jsxs('div', {
+    className: 'flex flex-col p-2',
+    children: [
+      jsxs('div', {
+        className: 'flex items-baseline gap-2 pb-1.5 text-[0.62rem]',
+        style: { color: C.faint },
+        children: [
+          jsx('span', { className: 'font-mono', style: { color: C.muted }, children: `${view.rows.length} decisions` }),
+          jsx('span', { children: summary })
+        ]
+      }),
+      jsxs('div', {
+        className: cn(cols, 'pb-1 text-[0.58rem] uppercase tracking-wider'),
+        style: { color: C.faint },
+        children: ['status', 'lane', 'ms', 'cost', 'call'].map(h => jsx('span', { children: h }, h))
+      }),
+      view.rows.slice(-80).reverse().map((r, i) => jsxs('div', {
+        className: cn(cols, 'border-t py-1 text-[0.66rem]'),
+        style: { borderColor: C.border },
+        children: [
+          jsx('span', { className: 'font-mono', style: { color: LEDGER_STATUS_COLOR[r.status] || C.faint }, children: r.status === 'regex_hit' ? 'regex' : r.status }),
+          jsx('span', { className: 'font-mono', style: { color: C.muted }, children: r.lane }),
+          jsx('span', { className: 'font-mono', style: { color: C.muted }, children: r.ms === null ? '—' : r.ms.toFixed(1) }),
+          jsx('span', { className: 'font-mono', style: { color: C.muted }, children: r.cost === null ? '—' : r.cost === 0 ? '0' : `$${r.cost.toFixed(4)}` }),
+          jsxs('span', {
+            className: 'min-w-0 truncate font-mono',
+            style: { color: r.allow === false ? C.red : C.text },
+            title: r.reason,
+            children: [
+              jsx('span', { style: { color: C.faint }, children: `${r.src} ` }),
+              r.label || '—',
+              r.reason ? jsx('span', { style: { color: C.faint }, children: ` — ${r.reason.slice(0, 60)}` }) : null
+            ]
+          })
+        ]
+      }, i))
     ]
   })
 }
@@ -2715,7 +2907,7 @@ function GhostDock({ e, route, runtimeId, storedId }) {
   })
 }
 
-const INSP_TABS = [['details', 'Details'], ['evidence', 'Evidence'], ['impact', 'Impact'], ['diff', 'Diff'], ['trace', 'Trace']]
+const INSP_TABS = [['details', 'Details'], ['evidence', 'Evidence'], ['impact', 'Impact'], ['ledger', 'Ledger'], ['diff', 'Diff'], ['trace', 'Trace']]
 
 function Inspector({ e, evMap }) {
   const [tab, setTab] = useState('details')
@@ -2742,6 +2934,17 @@ function Inspector({ e, evMap }) {
     },
     enabled: Boolean(e && storedId),
     staleTime: 15000
+  })
+  const ledgerQ = useQuery({
+    queryKey: ['hday-ledger', selKey],
+    queryFn: async () => {
+      const disp = await rpc(route, 'command.dispatch', { name: 'day-ledger', arg: storedId || '' })
+      const out = disp && (disp.output || disp.text || '')
+      return out && out.trim().startsWith('{') ? JSON.parse(out) : { ok: false }
+    },
+    enabled: Boolean(e && storedId),
+    refetchInterval: 5000,
+    staleTime: 2000
   })
   const ev = e ? feedEvidence(e, evMap) : null
 
@@ -2811,7 +3014,7 @@ function Inspector({ e, evMap }) {
           })
         ]
       }),
-      jsx(XrayBar, { events: allEvents, ev, storedId, route }),
+      jsx(XrayBar, { events: allEvents, ev, storedId, route, heat: hdayHeatTicks((ledgerQ.data && ledgerQ.data.ctxscore) || []) }),
       jsx(TurnScrubber, {
         turns, scrub, snaps: ev && ev.snaps, reverting, revertNote,
         onScrub: setScrub, onRevert: revertTo
@@ -2835,9 +3038,11 @@ function Inspector({ e, evMap }) {
             ? jsx(EvidenceView, { ev })
             : tab === 'impact'
               ? jsx(ImpactView, { data: impactQ.data, loading: impactQ.isLoading })
-              : tab === 'diff'
-                ? jsx(DiffView, { events })
-                : jsx(TraceView, { events })
+              : tab === 'ledger'
+                ? jsx(LedgerView, { data: ledgerQ.data, loading: ledgerQ.isLoading })
+                : tab === 'diff'
+                  ? jsx(DiffView, { events })
+                  : jsx(TraceView, { events })
       }),
       eventsQ.data && eventsQ.data.truncated
         ? jsx('div', { className: 'shrink-0 px-3 py-1 text-[0.62rem]', style: { color: C.faint, borderTop: `1px solid ${C.border}` }, children: 'replay window truncated — open the session for the full history' })
