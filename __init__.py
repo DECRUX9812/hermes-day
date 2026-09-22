@@ -61,6 +61,17 @@ Companion to the desktop cockpit (``desktop/plugin.js``). Registers:
   ``/day-evidence`` carries the same under ``guard``.
 - Rollback insurance — ``/day-rollback`` snapshots the current state first, so
   a rollback is itself reversible rather than a one-way door.
+- Test-integrity digest — a fingerprint of the suite taken at the first observed
+  mutation and re-checked at completion, so a test file rewritten through a
+  route the guard cannot inspect (an ``execute_code`` script, a generator, a
+  formatter) still surfaces as a regression instead of passing unnoticed. A
+  regression flags the verdict and shows under ``tamper``.
+- Credential watch — every tool result is scanned for credential-shaped
+  strings. Only the *sign* is recorded, never the bytes, so the alarm is not
+  itself a leak.
+- Evidence receipts — a settled verdict carries the command, exit code, tree
+  hash and counts behind it, exposed under ``receipt``. A verdict without its
+  receipt is just an opinion.
 
 State: per-session records in ``ctx.state`` under the ``sessions`` key
 (capped, trimmed), plus an in-memory mirror for hot-path updates.
@@ -88,7 +99,8 @@ _MAX_VERIFY_NUDGES = 2          # self-throttle; framework caps at agent.max_ver
 _MAX_APPROVALS = 40              # per-session approval ledger
 _MAX_PENDING_APPROVALS = 60      # in-flight request/response correlation set
 _MAX_ATTN = 40                   # per-session attention ledger
-_ATTN_KINDS = ("interrupted", "provider_error", "subagent_failed", "approval_stall")
+_ATTN_KINDS = ("interrupted", "provider_error", "subagent_failed",
+               "approval_stall", "secret_exposure", "test_tamper")
 _VACUUM_MIN_LINES = 40           # results longer than this get trimmed when armed
 _VACUUM_HEAD = 6
 _VACUUM_TAIL = 3
@@ -250,7 +262,8 @@ _PATH_KEYS = ("path", "file_path", "target_file", "filePath", "notebook_path")
 def _new_rec() -> Dict[str, Any]:
     return {"files": [], "runs": [], "blocks": [], "verdict": None,
             "detail": "", "at": 0.0, "nudges": 0, "snaps": [],
-            "approvals": [], "attn": [], "inst_epoch": 0.0}
+            "approvals": [], "attn": [], "inst_epoch": 0.0,
+            "test_digest": {}, "tamper": [], "receipt": {}}
 
 
 def _rec(sid: str) -> Dict[str, Any]:
@@ -733,6 +746,13 @@ def _post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
             failed_edit = False
         with _LOCK:
             rec = _rec(session_id)
+            # credential watch runs on every tool result, not just terminal
+            signs = _secret_signs(_result_text(result))
+            if signs:
+                _attn_add(rec, "secret_exposure",
+                          f"{', '.join(signs)} in {tool_name} output",
+                          tool=tool_name, signs=signs)
+                _persist()
             if tool_name in _FILE_EDIT_TOOLS:
                 path = next((str(args.get(k) or "") for k in _PATH_KEYS if args.get(k)), "")
                 if path and path not in rec["files"]:
@@ -740,6 +760,7 @@ def _post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
                     del rec["files"][: max(0, len(rec["files"]) - 40)]
                 if not failed_edit and _enabled("snaps"):
                     _snapshot(rec, session_id, path, f"{tool_name} {os.path.basename(path)}")
+                    _capture_test_digest(rec, rec.get("_root") or "")
                     _persist()
                 return
             if tool_name != "terminal":
@@ -747,6 +768,7 @@ def _post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
             cmd = str(args.get("command") or args.get("code") or "")
             if cmd and _WRITE_CMD_RE.search(cmd) and _enabled("snaps"):
                 _snapshot(rec, session_id, "", f"$ {cmd[:50]}")
+                _capture_test_digest(rec, rec.get("_root") or "")
             if not cmd or not _CHECK_RE.search(cmd):
                 return
             code = _exit_code(result, status)
@@ -850,14 +872,16 @@ def _snapshot(rec: Dict[str, Any], sid: str, hint_path: str, label: str) -> None
 def _settle_verdict(rec: Dict[str, Any]) -> None:
     """Set the durable verdict once the gate stops nudging (or passes)."""
     runs, blocks = rec["runs"], rec["blocks"]
+    tamper = rec.get("tamper") or []
     last = runs[-1] if runs else None
-    if last and last.get("ok") and not blocks:
+    if last and last.get("ok") and not blocks and not tamper:
         rec["verdict"] = "verified"
         rec["detail"] = f"exit 0 · {last.get('cmd', '')[:80]}"
-    elif blocks:
+    elif blocks or tamper:
         rec["verdict"] = "flagged"
         tail = f" · later check passed" if (last and last.get("ok")) else ""
-        rec["detail"] = f"honesty guard x{len(blocks)}{tail}"
+        rec["detail"] = (f"suite weakened · {tamper[0]}{tail}" if tamper
+                         else f"honesty guard x{len(blocks)}{tail}")
     elif last and not last.get("ok"):
         rec["verdict"] = "failed"
         rec["detail"] = f"exit {last.get('exit')} · {last.get('cmd', '')[:80]}"
@@ -865,6 +889,16 @@ def _settle_verdict(rec: Dict[str, Any]) -> None:
         rec["verdict"] = "missing"
         rec["detail"] = f"{len(rec['files'])} file(s) changed · no test/check run"
     rec["at"] = time.time()
+    # Evidence receipt: the claim, the command, and the tree it attaches to.
+    # A verdict without its receipt is just an opinion.
+    snaps = rec.get("snaps") or []
+    rec["receipt"] = {
+        "verdict": rec["verdict"], "detail": rec["detail"], "ts": rec["at"],
+        "cmd": (last or {}).get("cmd"), "exit": (last or {}).get("exit"),
+        "tree": snaps[-1].get("tree") if snaps else None,
+        "root": rec.get("_root"), "runs": len(runs), "blocks": len(blocks),
+        "tamper": len(tamper), "files": len(rec["files"]),
+    }
     _persist()
 
 
@@ -887,7 +921,16 @@ def _pre_verify(session_id: str = "", coding: bool = False, attempt: int = 0,
                 if isinstance(p, str) and os.path.isabs(p) and not os.path.exists(p)
             ]
 
-            if last and last.get("ok") and not missing_artifacts:
+            # The guard only sees terminal + file-edit calls; anything that
+            # rewrote a test through another route shows up here or nowhere.
+            tamper = _digest_regressions(rec)
+            if tamper:
+                for item in tamper:
+                    if item not in rec["tamper"]:
+                        rec["tamper"].append(item)
+                _attn_add(rec, "test_tamper", tamper[0], files=tamper[:5])
+
+            if last and last.get("ok") and not missing_artifacts and not tamper:
                 _settle_verdict(rec)
                 return None  # verified (or flagged if it cheated) — let the turn finish
 
@@ -897,7 +940,9 @@ def _pre_verify(session_id: str = "", coding: bool = False, attempt: int = 0,
 
             rec["nudges"] += 1
             n = len(rec["files"])
-            if blocks:
+            if tamper:
+                why = f"the test suite regressed during this session: {tamper[0]}"
+            elif blocks:
                 why = f"the honesty guard already blocked {len(blocks)} attempt(s) to weaken the test suite"
             elif last and not last.get("ok"):
                 why = f"your last check `{last.get('cmd', '')[:60]}` exited {last.get('exit')}"
@@ -954,6 +999,8 @@ def _public_rec(rec: Dict[str, Any]) -> Dict[str, Any]:
         "attn": (rec.get("attn") or [])[-12:],
         "subagents": dict(rec.get("subagents") or {}),
         "last_subagent": rec.get("sub_last") or {},
+        "tamper": (rec.get("tamper") or [])[-8:],
+        "receipt": dict(rec.get("receipt") or {}),
     }
 
 
@@ -1508,13 +1555,128 @@ def _cmd_attention(arg: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Registration
+# Test-integrity digest — catches suite weakening the guard never sees
+#
+# The honesty guard inspects `terminal` and file-edit tool calls only. Anything
+# that rewrites a test file through some other route (an `execute_code` script,
+# a generator, a formatter) walks straight past it. A digest taken at the first
+# observed mutation and re-checked at completion closes that hole: the question
+# at completion is not "did the guard block anything" but "is the suite still
+# at least as strong as it was when this session started touching it".
 # ---------------------------------------------------------------------------
+
+_DIGEST_MAX_FILES = 200
+_DIGEST_MAX_BYTES = 200_000
+
+
+def _digest_tests(root: str) -> Dict[str, Dict[str, int]]:
+    """Fingerprint every test file under *root*: assertion count + line count."""
+    out: Dict[str, Dict[str, int]] = {}
+    if not root or not os.path.isdir(root):
+        return out
+    try:
+        files = [p for p in _tracked_files(root) if _is_test_file(p)]
+    except Exception:
+        return out
+    for path in files[:_DIGEST_MAX_FILES]:
+        try:
+            if os.path.getsize(path) > _DIGEST_MAX_BYTES:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        out[os.path.relpath(path, root)] = {
+            "asserts": _assertion_lines(text, path),
+            "lines": len(text.splitlines()),
+        }
+    return out
+
+
+def _capture_test_digest(rec: Dict[str, Any], root: str) -> None:
+    """Take the baseline once per session, at the first observed mutation."""
+    if rec.get("test_digest") or not root:
+        return
+    rec["test_digest"] = _digest_tests(root)
+
+
+def _digest_regressions(rec: Dict[str, Any]) -> list:
+    """Test files that lost assertions, were truncated, or vanished."""
+    base = rec.get("test_digest") or {}
+    if not base:
+        return []
+    now = _digest_tests(rec.get("_root") or "")
+    weak = []
+    for rel, was in base.items():
+        cur = now.get(rel)
+        if cur is None:
+            weak.append(f"{rel} removed")
+            continue
+        if cur["asserts"] < was["asserts"]:
+            weak.append(f"{rel} assertions {was['asserts']} -> {cur['asserts']}")
+        elif was["lines"] >= 20 and cur["lines"] < was["lines"] // 2:
+            weak.append(f"{rel} truncated {was['lines']} -> {cur['lines']} lines")
+    return weak
+
+
+# ---------------------------------------------------------------------------
+# Credential-leak detector — report exposure without persisting the secret
+#
+# Tool output lands in the transcript, so a key echoed by a stray `env` or a
+# debug print is then in context and in every log downstream. Detecting it is
+# cheap; the discipline that matters is recording the *sign* and never the
+# bytes, so the alarm is not itself a leak.
+# ---------------------------------------------------------------------------
+
+_SECRET_PREFIXES = (
+    "sk-ant-", "sk-proj-", "sk-", "ghp_", "gho_", "ghs_", "ghr_", "github_pat_",
+    "xoxb-", "xoxp-", "xoxa-", "xoxr-", "AKIA", "ASIA", "AIza", "ya29.",
+)
+_SECRET_SIGNS_RE = re.compile(
+    "(?:" + "|".join(re.escape(p) for p in _SECRET_PREFIXES) + r")[A-Za-z0-9_\-]{16,}")
+_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9\-._~+/]{24,}=*")
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}")
+_SECRET_SCAN_BYTES = 200_000
+
+
+def _result_text(result: Any) -> str:
+    """Flatten a tool result to a bounded string for scanning."""
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result[:_SECRET_SCAN_BYTES]
+    try:
+        return json.dumps(result, default=str)[:_SECRET_SCAN_BYTES]
+    except Exception:
+        return str(result)[:_SECRET_SCAN_BYTES]
+
+
+def _secret_signs(text: str) -> list:
+    """Labels for credential-shaped strings in *text* — never the bytes."""
+    if not text:
+        return []
+    signs = []
+    if _PRIVATE_KEY_RE.search(text):
+        signs.append("private-key block")
+    if _SECRET_SIGNS_RE.search(text):
+        signs.append("api-key")
+    if _BEARER_RE.search(text):
+        signs.append("bearer header")
+    if _JWT_RE.search(text):
+        signs.append("jwt")
+    return signs
 
 
 def _cmd_guard(arg: str = "") -> str:
     """``[force]`` — guard liveness + over-blocking self-test."""
     return json.dumps(_canary(force=bool((arg or "").strip())))
+
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
 
 
 def _enabled(section: str) -> bool:
