@@ -2,10 +2,16 @@
 
 Companion to the desktop cockpit (``desktop/plugin.js``). Registers:
 
-- ``pre_tool_call`` — honesty guard. Blocks tool calls that fake a pass:
-  deleting/reverting/in-place-rewriting test files, gutting assertions via
-  file edits, ``--passWithNoTests``-style flags, and ``|| true`` exit
-  laundering on test/check commands.
+- ``pre_tool_call`` — unified permission gate. Phase 1 is the free regex
+  deny-list (blocks tool calls that fake a pass: deleting/reverting/
+  in-place-rewriting test files, gutting assertions via file edits,
+  ``--passWithNoTests``-style flags, ``|| true`` exit laundering). Phase 2,
+  for borderline/irreversible/outer-scope actions only, buys a typed
+  judgment (``hday_gate.decide`` + jev-shield's SystemOne client) and
+  escalates denials to the human approval gate. Every decision lands on one
+  per-session ledger (``gate``: ``regex_hit`` | ``judged`` | ``cached`` |
+  ``unjudged``); a missing/raising judge fails open with an ``unjudged``
+  mark, never a block.
 - ``post_tool_call`` — observes terminal runs; records test/lint/typecheck
   executions (command + exit status) as completion evidence.
 - ``pre_verify`` — completion gate. When the agent edited files and is about
@@ -95,14 +101,18 @@ State: per-session records in ``ctx.state`` under the ``sessions`` key
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import types
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 try:  # package-relative when Hermes loads this as hermes_plugins.<slug>
@@ -133,6 +143,8 @@ _MAX_VERIFY_NUDGES = 2          # self-throttle; framework caps at agent.max_ver
 _MAX_APPROVALS = 40              # per-session approval ledger
 _MAX_PENDING_APPROVALS = 60      # in-flight request/response correlation set
 _MAX_ATTN = 40                   # per-session attention ledger
+_MAX_GATE = 40                   # per-session decision ledger (unified gate)
+_GATE_REPEAT_LIMIT = 64          # per-session judged-action cache (identical action = $0)
 _ATTN_KINDS = ("interrupted", "provider_error", "subagent_failed",
                "approval_stall", "secret_exposure", "test_tamper")
 _VACUUM_MIN_LINES = 40           # results longer than this get trimmed when armed
@@ -144,6 +156,17 @@ _LOCK = threading.RLock()
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
 _VACUUM_ARMED: set = set()      # session_ids with context vacuum armed
 _INSTINCT_CACHE: Dict[str, list] = {}  # repo_root -> instincts (enabled ones first)
+
+# Unified-gate phase 2 state (typed judgment) — see "Unified gate" below.
+_GATE_REPEAT: "OrderedDict[str, OrderedDict]" = OrderedDict()  # sid -> action_key -> signals/None/Exception
+_GATE_MOD: Any = None          # hday_gate, path-loaded once (sibling file, no sys.path assumption)
+_GATE_MOD_TRIED = False
+_JEV_MOD: Any = None           # sibling jev-shield's shield_jev, path-loaded once
+_JEV_MOD_TRIED = False
+_JUDGE_UNSET = object()        # sentinel: _GATE_JUDGE untouched -> use the live adapter
+_GATE_JUDGE: Any = _JUDGE_UNSET  # test/embedder seam: callable | None (forces unjudged)
+_ESC_TTL = 5.0                 # approvals.mode/yolo are runtime state — short cache only
+_ESC_CACHE: Dict[str, Any] = {"at": 0.0, "value": True}
 
 # ---------------------------------------------------------------------------
 # Detection tables
@@ -298,7 +321,7 @@ def _new_rec() -> Dict[str, Any]:
             "detail": "", "at": 0.0, "nudges": 0, "snaps": [],
             "approvals": [], "attn": [], "inst_epoch": 0.0,
             "test_digest": {}, "tamper": [], "receipt": {},
-            "ctx_paths": []}
+            "ctx_paths": [], "gate": []}   # gate: regex_hit|judged|cached|unjudged
 
 
 def _rec(sid: str) -> Dict[str, Any]:
@@ -1067,6 +1090,14 @@ def _block(sid: str, tool_name: str, reason: str, rule: str = "Honesty Guard",
                                 "call": _call_preview(tool_name, args or {}),
                                 "intervention": message, "ts": time.time()},
                 _MAX_BLOCKS)
+        # the same veto also lands on the unified-gate ledger (one ledger for
+        # every decision, including the free regex ones)
+        _append(rec["gate"], {"kind": "regex_hit", "lane": "local", "ms": 0.0,
+                              "cost": 0.0, "ts": time.time(), "tool": tool_name,
+                              "call": _call_preview(tool_name, args or {}),
+                              "allow": False, "directive": "block",
+                              "rule": rule, "reason": _brief(reason, 240)},
+                _MAX_GATE)
         rec["verdict"] = "flagged"
         rec["detail"] = f"honesty guard x{len(rec['blocks'])}"
         rec["at"] = time.time()
@@ -1136,6 +1167,409 @@ def _canary(force: bool = False) -> Dict[str, Any]:
     return _CANARY
 
 
+# ---------------------------------------------------------------------------
+# Unified gate — phase 2: typed judgment (hday_gate.decide + jev-shield)
+#
+# Order (per the harness plan): the regex deny-list above is free and runs
+# first; only an action that survives it AND smells irreversible / outer-scope
+# buys a typed judgment (4 noul + 1 blast-radius choice, judged by the sibling
+# jev-shield plugin's SystemOne client). Every decision lands on ONE ledger —
+# rec["gate"] rows of kind regex_hit | judged | cached | unjudged. Fail-open,
+# loudly: no key / timeout / judge error means stock behaviour PLUS an
+# `unjudged` mark — but only when the typed phase was actually needed, so the
+# hot path stays free for benign calls.
+# ---------------------------------------------------------------------------
+
+#: Command-channel tools whose command is screened for borderline patterns.
+_GATE_SHELL_TOOLS = {"terminal", "shell_exec", "run_command", "process_manage",
+                     "execute_code", "bash", "shell", "powershell", "cmd"}
+_GATE_PATH_KEYS = _PATH_KEYS + (
+    "directory", "dir", "dest", "destination", "target", "target_path",
+    "output", "output_path", "repo_path", "workspace_path")
+
+#: Borderline patterns — mirrored from jev-shield's tier-0 screener
+#: (shield_risk._SHELL_PATTERNS). These do NOT decide anything; they only
+#: decide whether a paid judgment is warranted.
+_GATE_CMD_PATTERNS = (
+    ("fs_destructive", (
+        r"\brm\s+(?:-[a-zA-Z]+=\S+\s+)*-[a-zA-Z]*[rf][a-zA-Z]*(?:\s|$)",
+        r"\bmkfs(?:\.\w+)?\b", r"\bdd\s+[^|;]*\bof=", r"\bshred\b",
+        r"\bfind\b[^|;]*\s-delete\b", r"\btruncate\s+-s\s*0\b",
+        r"\bgit\s+reset\s+--hard\b", r"\bgit\s+clean\s+-[a-z]*[fdx]",
+        r"\bgit\s+push\b[^|;]*--force", r"\bgit\s+branch\s+-D\b",
+        r"\bdrop\s+(?:table|database|schema)\b",
+        r"\bdelete\s+from\b(?![\s\S]*\bwhere\b)", r"\btruncate\s+table\b",
+        r"\bkubectl\s+delete\b", r"\bdocker\s+(?:rm|rmi|volume\s+rm)\b",
+    )),
+    ("privilege", (
+        r"\bsudo\b", r"\bsu\s+-", r"\bdoas\b",
+        r"\bchmod\s+(?:-[a-zA-Z]+=\S+\s+)*(?:-[a-zA-Z]+\s+)*777\b",
+        r"\bchown\s+-R\b", r"\bsetcap\b", r"\bvisudo\b",
+    )),
+    ("system_state", (
+        r"\bsystemctl\s+(?:stop|disable|mask|restart|kill)\b",
+        r"\b(?:shutdown|reboot|halt|poweroff)\b", r"\bkill\s+-9\b", r"\bpkill\b",
+        r"\biptables\b", r"\bnft\b", r"\bufw\b", r"\b(?:mount|umount)\b",
+        r"\bcrontab\b", r"\blaunchctl\b",
+    )),
+    ("pipe_exec", (
+        r"\b(?:curl|wget)\b[^|;]*\|\s*(?:sudo\s+)?(?:ba|z|k|da)?sh\b",
+        r"\bbase64\s+-d\b[^|;]*\|\s*(?:ba|z)?sh\b",
+        r"\beval\s+[\"']?\$\(", r"\b(?:sh|ba|z)sh\s+-c\s*[\"']?\$\(",
+    )),
+    ("remote_exec", (
+        r"\bssh\s+\S", r"\bscp\s+\S", r"\brsync\b[^|;]*\S+:", r"\bmosh\s+\S",
+        r"\bsocat\b",
+    )),
+    ("network_egress", (
+        r"\bcurl\b[^|;]*(?:-X\s*(?:POST|PUT|PATCH)|--data\b|-d\s|--upload-file|-T\s|--form|-F\s|@)",
+        r"\bwget\b[^|;]*--post", r"\bscp\s+\S+\s+\S+:", r"\brsync\b[^|;]*\S+:",
+        r"\bgit\s+push\b", r"\bgh\s+(?:pr|release|gist)\b",
+        r"\b(?:npm|pip|pip3|uv)\s+(?:publish|upload)\b",
+        r"\baws\s+s3\s+(?:cp|sync|rm)\b", r"\bs3cmd\b",
+        r"\bgcloud\s+(?:storage|compute|secrets)\b",
+        r"\b(?:vercel|netlify|flyctl|heroku|wrangler)\b",
+    )),
+)
+
+#: Sensitive roots/names — mirrored from shield_risk._SENSITIVE_ROOTS +
+#: _CREDENTIAL_NAMES.
+_GATE_SENSITIVE_RE = re.compile(
+    r"\.ssh|\.aws|\.gnupg|\.kube|\.docker/config|himalaya|keychains|"
+    r"(?:^|/)(?:etc|boot|usr/bin|usr/lib|var/lib)(?:/|$)",
+    re.I)
+_GATE_CREDENTIAL_NAMES = frozenset({
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "authorized_keys",
+    "credentials", ".env", ".netrc", ".pgpass", ".npmrc", ".pypirc",
+    "kubeconfig", "shadow", "passwd",
+})
+#: Filesystem-ish tokens inside a command line (mirrors _PATH_TOKEN_RE).
+_GATE_TOKEN_RE = re.compile(r"(?:~|\.{0,2}/)[^\s'\"|;&()<>]*")
+
+
+def _gate_path_classes(path: str) -> list:
+    """``sensitive_path``/``credential_path``/``outside_workspace`` for one
+    path-ish token. Bare separators (``/``, ``./``) carry no signal — this is
+    the one deliberate deviation from shield_risk, whose tokenizer turns the
+    trailing slash of ``tests/`` into a ``/`` token and over-flags."""
+    text = str(path or "").strip().strip("\"'")
+    if not text.strip("/. ~"):
+        return []
+    lowered = text.replace("\\", "/").lower()
+    classes: list = []
+    if _GATE_SENSITIVE_RE.search(lowered):
+        classes.append("sensitive_path")
+    base = os.path.basename(lowered.rstrip("/"))
+    if base in _GATE_CREDENTIAL_NAMES or base.startswith(".env"):
+        classes.append("credential_path")
+    if text.startswith("~") or os.path.isabs(text):
+        target = os.path.abspath(os.path.expanduser(text))
+    elif ".." in text.split("/"):
+        target = os.path.abspath(os.path.join(os.getcwd(), text))
+    else:
+        return classes
+    root = os.path.abspath(os.getcwd())
+    scratch = os.path.abspath(os.environ.get("TMPDIR", "/tmp"))
+    inside = target == root or target.startswith(root + os.sep)
+    if not inside and not (target == scratch or target.startswith(scratch + os.sep)):
+        classes.append("outside_workspace")
+    return classes
+
+
+def _gate_screen(tool_name: str, args: Dict[str, Any]) -> tuple:
+    """The free pre-filter in front of the paid typed gate: borderline /
+    irreversible / outer-scope signal classes, or ``()`` for clean."""
+    classes: list = []
+    if tool_name in _GATE_SHELL_TOOLS:
+        cmd = str(args.get("command") or args.get("cmd") or args.get("code") or "")
+        for klass, patterns in _GATE_CMD_PATTERNS:
+            if any(re.search(p, cmd, re.I) for p in patterns):
+                classes.append(klass)
+        for token in _GATE_TOKEN_RE.findall(cmd):
+            if "/" in token:
+                classes.extend(_gate_path_classes(token))
+    for key in _GATE_PATH_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value:
+            classes.extend(_gate_path_classes(value))
+    try:
+        blob = json.dumps(args, default=str)
+    except Exception:
+        blob = str(args)
+    if _secret_signs(blob):
+        classes.append("credential_literal")
+    return tuple(dict.fromkeys(classes))
+
+
+def _gate_borderline(tool_name: str, args: Dict[str, Any]) -> bool:
+    """Is this call worth a paid typed judgment?"""
+    return bool(_gate_screen(tool_name, args))
+
+
+def _load_hday_gate() -> Any:
+    """Path-load the sibling ``hday_gate.py`` once — same convention as
+    ``patches/``: no sys.path assumption, failure degrades to regex-only."""
+    global _GATE_MOD, _GATE_MOD_TRIED
+    if _GATE_MOD_TRIED:
+        return _GATE_MOD
+    _GATE_MOD_TRIED = True
+    try:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "hday_gate.py")
+        spec = importlib.util.spec_from_file_location("hday_gate_runtime", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["hday_gate_runtime"] = mod
+        spec.loader.exec_module(mod)
+        _GATE_MOD = mod
+    except Exception:
+        _GATE_MOD = None
+    return _GATE_MOD
+
+
+def _load_shield_jev() -> Any:
+    """Path-load the sibling jev-shield plugin's ``shield_jev`` once.
+
+    Reuse, not re-implementation: shield_jev.py is stdlib-only and already
+    carries the 4-noul + blast-radius question set, the SystemOne client, and
+    key resolution. Absent jev-shield -> the typed phase reports ``unjudged``
+    rather than crashing.
+    """
+    global _JEV_MOD, _JEV_MOD_TRIED
+    if _JEV_MOD_TRIED:
+        return _JEV_MOD
+    _JEV_MOD_TRIED = True
+    try:
+        from hermes_constants import get_hermes_home
+        homes = [str(get_hermes_home())]
+    except Exception:
+        homes = []
+    homes.append(os.path.expanduser("~/.hermes"))
+    candidates = [os.path.join(h, "plugins", "jev-shield", "shield_jev.py")
+                  for h in homes]
+    candidates.append(os.path.expanduser(
+        "~/Code/jev-shield/plugins/jev-shield/shield_jev.py"))  # dev checkout
+    try:
+        import importlib.util
+        for path in candidates:
+            try:
+                if not os.path.isfile(path):
+                    continue
+                spec = importlib.util.spec_from_file_location(
+                    "hday_jev_shield", path)
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["hday_jev_shield"] = mod
+                spec.loader.exec_module(mod)
+                _JEV_MOD = mod
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return _JEV_MOD
+
+
+def _gate_judge_live(action: str, request: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    """The paid typed judgment — jev-shield's ``ask_jev`` over its own
+    SystemOne client. Raises on any failure (``decide`` converts that to a
+    loud ``unjudged``); never swallows the reason."""
+    sjev = _load_shield_jev()
+    if sjev is None:
+        raise RuntimeError("jev-shield plugin not installed — typed gate unavailable")
+    args = context.get("args") if isinstance(context.get("args"), dict) else {}
+    cmd = str(context.get("command") or args.get("command") or args.get("code") or "")
+    try:
+        blob = json.dumps(args, ensure_ascii=False, default=str)
+    except Exception:
+        blob = str(args)
+    screen = types.SimpleNamespace(
+        action_text=(f"tool={action}"
+                     + (f" command={cmd}" if cmd else f" args={blob}"))[:600],
+        classes=tuple(context.get("classes") or ()))
+    cfg = {"_workspace": str(context.get("workspace") or os.getcwd())}
+    answers, meta = sjev.ask_jev(screen, request,
+                                 str(context.get("platform") or ""), cfg)
+    if answers is None:
+        raise RuntimeError(
+            f"typed judge unavailable: {(meta or {}).get('reason') or 'no judgment'}")
+    out = dict(answers)
+    out.update(lane="hosted", cost=float((meta or {}).get("cost_usd") or 0.0),
+               model=str((meta or {}).get("model") or ""))
+    return out
+
+
+def _gate_key(tool_name: str, args: Dict[str, Any]) -> str:
+    """Identical action -> identical key -> judged once per session."""
+    try:
+        blob = json.dumps(args, sort_keys=True, default=str)
+    except Exception:
+        blob = repr(args)
+    return hashlib.sha1(f"{tool_name}|{blob}".encode("utf-8", "replace")
+                        ).hexdigest()[:16]
+
+
+def _mandate_explicit(rec: Dict[str, Any]) -> bool:
+    """A human already answered 'yes' on this session's REAL approval stream —
+    the strongest explicit-mandate signal the ledger holds. Aux-LLM smart
+    approvals are not a human mandate."""
+    for a in rec.get("approvals") or []:
+        choice = str(a.get("choice") or "")
+        if not choice or choice in _DENY_CHOICES or choice in _STALL_CHOICES:
+            continue
+        if str(a.get("by") or "") == "aux_llm":
+            continue
+        return True
+    return False
+
+
+def _gate_escalation_available() -> bool:
+    """Can an ``approve`` directive actually reach a human right now?
+
+    With ``approvals.mode: off`` (or yolo) core auto-approves an escalated
+    call, so emitting ``approve`` would silently let the action through —
+    mirrored from jev-shield's escalation_available. Best-effort: when core's
+    approval state cannot be inspected, assume a human is reachable.
+    """
+    now = time.monotonic()
+    if _ESC_CACHE["at"] and now - _ESC_CACHE["at"] < _ESC_TTL:
+        return bool(_ESC_CACHE["value"])
+    available = True
+    try:
+        from tools.approval_context import _get_approval_mode  # type: ignore
+        if str(_get_approval_mode() or "").strip().lower() == "off":
+            available = False
+    except Exception:
+        pass
+    if available:
+        try:
+            from tools.approval import _yolo_active  # type: ignore
+            if _yolo_active():
+                available = False
+        except Exception:
+            pass
+    _ESC_CACHE.update(at=now, value=available)
+    return available
+
+
+def _gate_log(sid: str, tool_name: str, args: Dict[str, Any],
+              row: Dict[str, Any], allow: bool, reason: str,
+              directive: str = "none") -> None:
+    """Append one decision to the session's gate ledger. Caller may NOT hold
+    _LOCK (this takes it). Never raises."""
+    try:
+        entry = {"kind": str((row or {}).get("kind") or "unjudged"),
+                 "lane": str((row or {}).get("lane") or "local"),
+                 "ms": float((row or {}).get("ms") or 0.0),
+                 "cost": float((row or {}).get("cost") or 0.0),
+                 "ts": time.time(), "tool": tool_name,
+                 "call": _call_preview(tool_name, args),
+                 "allow": bool(allow), "directive": directive,
+                 "reason": _brief(reason, 240)}
+        for k in ("rule", "detail", "signals", "mandate_explicit", "screen"):
+            if isinstance(row, dict) and k in row:
+                entry[k] = row[k]
+        with _LOCK:
+            rec = _rec(sid)
+            _append(rec["gate"], entry, _MAX_GATE)
+            rec["at"] = time.time()
+            _persist()
+    except Exception:
+        pass
+
+
+def _typed_gate(tool_name: str, args: Dict[str, Any],
+                session_id: str, screen: tuple = ()) -> Optional[Dict[str, str]]:
+    """Phase 2 of the unified gate. Runs only for borderline actions that
+    survived the regex veto. Never raises; never holds _LOCK across the paid
+    judge call."""
+    sid = session_id or "_unknown"
+    gate = _load_hday_gate()
+    if gate is None:
+        _gate_log(sid, tool_name, args, {"kind": "unjudged"}, True,
+                  "gate module hday_gate.py unavailable — fail-open")
+        return None
+
+    with _LOCK:
+        rec = _rec(sid)
+        request = str(rec.get("user_request") or "")
+        platform = str(rec.get("platform") or "")
+        mandate = _mandate_explicit(rec)
+    ctx: Dict[str, Any] = {"args": dict(args), "workspace": os.getcwd(),
+                           "platform": platform, "mandate_explicit": mandate}
+    cmd = str(args.get("command") or args.get("code") or "")
+    if cmd:
+        ctx["command"] = cmd
+    path = next((str(args.get(k) or "") for k in _PATH_KEYS if args.get(k)), "")
+    if path:
+        ctx["path"] = path
+    ctx["classes"] = list(screen)
+
+    repeats = _GATE_REPEAT.setdefault(sid, OrderedDict())
+    while len(_GATE_REPEAT) > _MAX_SESSIONS:
+        _GATE_REPEAT.pop(next(iter(_GATE_REPEAT)))
+    key = _gate_key(tool_name, args)
+    captured: Dict[str, Any] = {}
+    if key in repeats:
+        res = repeats[key]
+        repeats.move_to_end(key)
+
+        def judge(_a: Any, _u: Any, _c: Any, res: Any = res) -> Any:
+            if isinstance(res, Exception):
+                raise res            # replay the failure — no second paid call
+            if isinstance(res, dict):
+                return dict(res, cached=True, cost=0.0)
+            return None
+    else:
+        live = _gate_judge_live if _GATE_JUDGE is _JUDGE_UNSET else _GATE_JUDGE
+        if live is None:
+            judge = None             # decide() -> unjudged, loudly
+        else:
+            def judge(a: Any, u: Any, c: Any) -> Any:
+                try:
+                    out = live(a, u, c)
+                except Exception as exc:
+                    captured["res"] = exc
+                    raise
+                captured["res"] = out
+                return out
+
+    try:
+        decision = gate.decide(tool_name, request, ctx, judge=judge)
+    except Exception as exc:  # decide() never raises by contract; belt anyway
+        _gate_log(sid, tool_name, args, {"kind": "unjudged"}, True,
+                  f"decide raised {type(exc).__name__}: {exc} — fail-open")
+        return None
+    if key not in repeats and "res" in captured:
+        repeats[key] = captured["res"]
+        while len(repeats) > _GATE_REPEAT_LIMIT:
+            repeats.popitem(last=False)
+
+    allow = bool(decision.get("allow"))
+    row = decision.get("row") if isinstance(decision.get("row"), dict) else {}
+    reason = str(decision.get("reason") or "")
+    if not allow and str(decision.get("kind")) == "regex_hit":
+        # the mirrored deny-list caught drift the local one missed — take the
+        # existing block path (it writes its own regex_hit row)
+        return _block(sid, tool_name,
+                      str(row.get("detail") or reason or "deny-list hit"),
+                      str(row.get("rule") or "Honesty Guard"), args)
+    directive = "none"
+    if not allow:
+        directive = "approve" if _gate_escalation_available() else "block"
+    _gate_log(sid, tool_name, args, row, allow, reason, directive=directive)
+    if directive == "approve":
+        blast = str((row.get("signals") or {}).get("blast_radius") or "local")
+        return {"action": "approve",
+                "message": "[hermes-day gate] " + (reason or "escalated")[:400],
+                "rule_key": f"hday-gate:{tool_name}:{blast}"}
+    if directive == "block":
+        return {"action": "block",
+                "message": "[hermes-day gate] " + (reason or "escalated")[:400]
+                + " — no human approval gate is reachable (approvals off / "
+                  "yolo), so it is blocked rather than auto-approved."}
+    return None
+
+
 def _pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
                    session_id: str = "", **_kw: Any) -> Optional[Dict[str, str]]:
     try:
@@ -1160,10 +1594,15 @@ def _pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None,
         elif tool_name in _FILE_EDIT_TOOLS:
             path = next((str(args.get(k) or "") for k in _PATH_KEYS if args.get(k)), "")
             hit = _edit_violation(path, args)
-        if not hit:
-            return None
-        reason, rule = hit
-        return _block(session_id, tool_name, reason, rule, args)
+        if hit:
+            reason, rule = hit
+            return _block(session_id, tool_name, reason, rule, args)
+        # phase 2 — the typed gate sits BEHIND the free deny-list and only
+        # pays for judgment when the action could be irreversible/outer-scope
+        screen = _gate_screen(tool_name, args) if _enabled("typed") else ()
+        if screen:
+            return _typed_gate(tool_name, args, session_id, screen)
+        return None
     except Exception:
         return None  # never let the guard wedge the tool loop
 
@@ -1470,6 +1909,7 @@ def _public_rec(rec: Dict[str, Any]) -> Dict[str, Any]:
         "vacuum": dict(rec.get("vacuum") or {}),
         "approvals": (rec.get("approvals") or [])[-12:],
         "attn": (rec.get("attn") or [])[-12:],
+        "gate": (rec.get("gate") or [])[-12:],
         "subagents": dict(rec.get("subagents") or {}),
         "last_subagent": rec.get("sub_last") or {},
         "tamper": (rec.get("tamper") or [])[-8:],
@@ -1482,7 +1922,7 @@ def _cmd_evidence(arg: str = "") -> str:
         sessions = {sid: _public_rec(r) for sid, r in _SESSIONS.items()
                     if r.get("verdict") or r.get("runs") or r.get("blocks")
                     or r.get("vacuum") or (r.get("snaps") or [])
-                    or r.get("approvals") or r.get("attn")}
+                    or r.get("approvals") or r.get("attn") or r.get("gate")}
     sid = (arg or "").strip()
     if sid:
         return json.dumps({"ok": True, "guard": _canary(),
@@ -1957,12 +2397,18 @@ def _pre_llm_call(session_id: str = "", user_message: str = "",
     sanctioned, cache-safe channel. Silent unless something genuinely new landed.
     """
     try:
-        # The armed vacuum scores chunks against "the current goal"; the latest
-        # user message is that goal. Recorded for every session, independent of
-        # the instincts feature flag.
-        if isinstance(user_message, str) and user_message.strip():
+        # The armed vacuum scores chunks against "the current goal"; the typed
+        # gate judges intent_consistent against "user_request". Both are the
+        # user's own words — the latest user message — recorded for every
+        # session, independent of the instincts feature flag.
+        if session_id and (user_message or platform):
             with _LOCK:
-                _rec(session_id)["goal"] = _brief(user_message, 800)
+                rec = _rec(session_id)
+                if isinstance(user_message, str) and user_message.strip():
+                    rec["goal"] = _brief(user_message, 800)
+                    rec["user_request"] = str(user_message)[:800]
+                if platform:
+                    rec["platform"] = str(platform)
         if not _enabled("instincts"):
             return None
         with _LOCK:

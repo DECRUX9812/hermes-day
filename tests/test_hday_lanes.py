@@ -109,17 +109,23 @@ def test_lane_allows_reads_and_untagged_children(day):
                session_id="lane-1") is None
     assert pre(tool_name="read_file", args={"path": "/x/a.py"},
                session_id="lane-1") is None
-    # an untagged child writing a non-test file is not the guard's business
+    # an untagged child writing a non-test file is not lane-restricted: the
+    # verdict must not be the read-only-lane block. (An OUTER-scope path like
+    # /x/notes.py legitimately trips the typed gate's escalation — see
+    # test_outer_scope_write_in_untagged_child_escalates — so this contract is
+    # asserted on an in-scope path, which is what the lane rule itself governs.)
     assert pre(tool_name="write_file",
-               args={"path": "/x/notes.py", "content": "x"},
+               args={"path": os.path.join(root, "notes.py"), "content": "x"},
                session_id="lane-2") is None
     # the lane ends with the child
     _fire(ctx, "subagent_stop", parent_session_id=parent,
           child_session_id="lane-1", child_role="leaf",
           child_status="completed")
     assert "lane-1" not in module._READ_ONLY_LANES
+    # lane ended → the lane veto is gone (in-scope path; see the note above on
+    # why this contract is asserted in-scope)
     assert pre(tool_name="write_file",
-               args={"path": "/x/notes.py", "content": "x"},
+               args={"path": os.path.join(root, "notes.py"), "content": "x"},
                session_id="lane-1") is None
 
 
