@@ -32,7 +32,10 @@ Companion to the desktop cockpit (``desktop/plugin.js``). Registers:
 - ``transform_tool_result`` — context vacuum. When a session is armed via
   ``/day-vacuum <session_key>`` (or the cockpit button), verbose terminal
   outputs are archived to disk and replaced with a compact placeholder
-  before they enter context.
+  before they enter context. With a judge reachable, ``hday_ctxscore``
+  scores each chunk against the session's current goal (the latest user
+  message, captured by ``pre_llm_call``) so a chunk the goal still needs
+  survives verbatim while irrelevant ones collapse to marked excerpts.
 - ``pre_approval_request`` / ``post_approval_response`` — observer-only
   (they cannot veto), but they expose the REAL approval stream: the command,
   the pattern that fired, which surface asked (cli/gateway/smart), whether a
@@ -474,6 +477,12 @@ def _transform_tool_result(tool_name: str = "", args: Optional[Dict[str, Any]] =
     Results usually arrive as a JSON envelope (``{"stdout": ..., "exit": 0}``)
     — one physical line — so the line test runs on the biggest string field
     inside the payload, and the field is replaced while the envelope survives.
+
+    With a judge reachable, the dump goes through ``hday_ctxscore`` first:
+    chunks are scored against the session's current goal in ONE batched
+    request and each gets a disposition (whole / long / small / hide). A chunk
+    the goal needs survives verbatim; irrelevant ones collapse to marked
+    placeholders. No judge → the stock head/tail trim runs unchanged.
     """
     try:
         if session_id not in _VACUUM_ARMED or not _enabled("vacuum"):
@@ -503,21 +512,270 @@ def _transform_tool_result(tool_name: str = "", args: Optional[Dict[str, Any]] =
         path = os.path.join(root, f"dump-{n}.log")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(result if isinstance(result, str) else str(result))
-        kept = lines[:_VACUUM_HEAD] + lines[-_VACUUM_TAIL:]
         code = parsed.get("exit_code") if isinstance(parsed, dict) else None
-        marker = (f"\n[Trimmed stdout: exit {code if code is not None else '?'}, "
-                  f"{len(lines)} lines cached at {path}]")
-        trimmed = "\n".join(kept) + marker
+
+        scored = _ctxscore_vacuum(body, session_id)   # None → legacy trim below
+        if scored is not None:
+            trimmed, judged, cached, unjudged, lane, n_chunks = scored
+            trimmed += (f"\n[ctxscore vacuum: {n_chunks} chunks, {judged} judged/"
+                        f"{cached} cached/{unjudged} unjudged on {lane}; "
+                        f"full dump archived at {path}]")
+        else:
+            kept = lines[:_VACUUM_HEAD] + lines[-_VACUUM_TAIL:]
+            marker = (f"\n[Trimmed stdout: exit {code if code is not None else '?'}, "
+                      f"{len(lines)} lines cached at {path}]")
+            trimmed = "\n".join(kept) + marker
+            judged = cached = unjudged = n_chunks = 0
+            lane = ""
         out = trimmed if field is None else json.dumps({**parsed, field: trimmed})
         with _LOCK:
             rec = _rec(session_id)
-            vac = rec.setdefault("vacuum", {"armed": True, "trimmed": 0, "saved_chars": 0})
+            vac = rec.setdefault("vacuum", {"armed": True, "trimmed": 0, "saved_chars": 0,
+                                            "scored": 0, "judged": 0, "cached": 0,
+                                            "unjudged": 0})
             vac["trimmed"] += 1
             vac["saved_chars"] += max(0, len(body) - len(trimmed))
+            vac["scored"] = vac.get("scored", 0) + n_chunks
+            vac["judged"] = vac.get("judged", 0) + judged
+            vac["cached"] = vac.get("cached", 0) + cached
+            vac["unjudged"] = vac.get("unjudged", 0) + unjudged
+            if lane:
+                vac["lane"] = lane
             _persist()
         return out
     except Exception:
         return None
+
+
+def _ctxscore_vacuum(body: str, session_id: str) -> Optional[tuple]:
+    """Score + disposition one dump body. ``None`` → caller runs the legacy trim.
+
+    Returns ``(text, judged, cached, unjudged, lane, n_chunks)``. Never raises:
+    any failure leaves the trim path in charge.
+    """
+    try:
+        cs = _ctxscore()
+        judge = _ctx_judge()
+        if cs is None or judge is None:
+            return None
+        with _LOCK:
+            goal = str(_rec(session_id).get("goal") or "")
+        chunks = cs.chunker(body)
+        res = cs.score(chunks, goal, judge=judge, min_lines=_VACUUM_MIN_LINES)
+        text = cs.apply_dispositions(chunks, res)
+        judged = sum(1 for r in res.rows if r["status"] == "judged")
+        cached = sum(1 for r in res.rows if r["status"] == "cached")
+        unjudged = sum(1 for r in res.rows if r["status"] == "unjudged")
+        lane = res.rows[0]["lane"] if res.rows else "local"
+        return text, judged, cached, unjudged, lane, len(chunks)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ctxscore judge plumbing — local open-Jev first, hosted only on low confidence
+#
+# ``_CTX_JUDGE`` is the injection seam: tests and the integrator pin a callable
+# ``judge(state, questions)`` there and the resolver below never runs.
+# Otherwise the judge resolves lazily once per process: the local open-Jev
+# TypedEngine (``~/Code/openjev``, ~6 ms, free) answers in the hot path; the
+# hosted TypeSafe endpoint is reached only when the local lane is missing or
+# its answer batch is below ``_CTX_LOCAL_MIN_CONF``. No lane → no judge → the
+# armed vacuum degrades to the stock trim (fail-open, marked ``unjudged``).
+# ---------------------------------------------------------------------------
+
+_CTX_JUDGE: Any = None            # injected judge (tests/integrator) wins
+_CTX_JUDGE_RESOLVED = False       # lazy resolution ran once
+_CTX_MODULE: Any = None           # hday_ctxscore module, or False when unloadable
+_CTX_LOCAL_MIN_CONF = 0.55        # escalate a batch whose weakest answer dips below
+_OPENJEV_DIRS = (os.path.join(os.path.expanduser("~"), "Code", "openjev"),)
+_CTX_MODEL = "jev-latest"
+_CTX_ENDPOINT = "/v1/systemone"
+_CTX_BASE_URL = "https://api.typesafe.ai"
+
+
+def _ctxscore() -> Any:
+    """Load ``hday_ctxscore`` once — the plugin dir is not a package.
+
+    A normal import wins when the plugin dir is already importable (tests);
+    otherwise it is loaded by path like the patches lanes are. The module is
+    registered in ``sys.modules`` before exec — ``@dataclass`` resolves
+    ``sys.modules[cls.__module__]`` during decoration and dies on a phantom.
+    """
+    global _CTX_MODULE
+    if _CTX_MODULE is None:
+        try:
+            import sys as _sys
+            _mod = _sys.modules.get("hday_ctxscore")
+            if _mod is None:
+                import importlib.util as _ilu
+                _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "hday_ctxscore.py")
+                _spec = _ilu.spec_from_file_location("hday_ctxscore", _p)
+                _mod = _ilu.module_from_spec(_spec)
+                _sys.modules["hday_ctxscore"] = _mod
+                try:
+                    _spec.loader.exec_module(_mod)
+                except Exception:
+                    _sys.modules.pop("hday_ctxscore", None)
+                    raise
+            _CTX_MODULE = _mod
+        except Exception:
+            _CTX_MODULE = False
+    return _CTX_MODULE or None
+
+
+def _ctx_judge() -> Any:
+    """The judge callable for ctxscore, or ``None`` — resolved once per process."""
+    global _CTX_JUDGE, _CTX_JUDGE_RESOLVED
+    if _CTX_JUDGE is not None:
+        return _CTX_JUDGE
+    if not _CTX_JUDGE_RESOLVED:
+        _CTX_JUDGE_RESOLVED = True
+        try:
+            _CTX_JUDGE = _build_ctx_judge()
+        except Exception:
+            _CTX_JUDGE = None
+    return _CTX_JUDGE
+
+
+def _build_ctx_judge() -> Any:
+    local = _local_ctx_engine()
+    hosted = _hosted_ctx_client()
+    if local is None and hosted is None:
+        return None
+    return _CtxJudge(local=local, hosted=hosted)
+
+
+def _local_ctx_engine() -> Any:
+    """open-Jev ``TypedEngine`` — the free ~6 ms lane. ``None`` when not runnable."""
+    eng_cls = None
+    try:
+        from openjev.typed import TypedEngine as eng_cls  # type: ignore  # installed case
+    except Exception:
+        import sys
+        for cand in _OPENJEV_DIRS:
+            if not os.path.isfile(os.path.join(cand, "openjev", "typed.py")):
+                continue
+            try:
+                if cand not in sys.path:
+                    sys.path.insert(0, cand)
+                from openjev.typed import TypedEngine as eng_cls  # noqa: F811
+                break
+            except Exception:
+                continue
+    if eng_cls is None:
+        return None
+    try:
+        return eng_cls()          # raises when the embedder backend is missing
+    except Exception:
+        return None
+
+
+def _ctx_api_key(env_name: str = "TYPESAFE_API_KEY") -> Optional[str]:
+    """Env var first, then the active profile's ``$HERMES_HOME/.env``."""
+    value = (os.environ.get(env_name) or "").strip()
+    if value:
+        return value
+    try:
+        from hermes_constants import get_hermes_home
+        env_file = os.path.join(get_hermes_home(), ".env")
+    except Exception:
+        env_file = os.path.join(os.path.expanduser("~"), ".hermes", ".env")
+    try:
+        with open(env_file, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if line.startswith(f"{env_name}="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'") or None
+    except OSError:
+        pass
+    return None
+
+
+class _CtxJevClient:
+    """Hosted lane: one stdlib POST per scoring pass, no retries beyond transport."""
+
+    lane = "hosted"
+
+    def __init__(self, api_key: str, base_url: str = "", model: str = "",
+                 timeout: float = 10.0) -> None:
+        self.api_key = api_key
+        self.base_url = (base_url or _CTX_BASE_URL).rstrip("/")
+        self.model = model or _CTX_MODEL
+        self.timeout = timeout
+
+    def ask(self, state: Any, questions: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /v1/systemone → parsed body; raises so ctxscore fails open."""
+        import urllib.request
+        body = json.dumps({"state": state, "model": self.model,
+                           "questions": dict(questions)},
+                          ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}{_CTX_ENDPOINT}", data=body, method="POST",
+            headers={"Authorization": f"Bearer {self.api_key}",
+                     "Content-Type": "application/json",
+                     "Accept": "application/json",
+                     "User-Agent": "hermes-day-ctxscore/0.1"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as fh:
+            return json.loads(fh.read().decode("utf-8"))
+
+
+def _hosted_ctx_client() -> Any:
+    key = _ctx_api_key()
+    return _CtxJevClient(key) if key else None
+
+
+def _ctx_low_confidence(response: Any) -> bool:
+    """True when the local batch's weakest answer dips below the escalate line."""
+    try:
+        answers = response.get("answers") if isinstance(response, dict) \
+            else getattr(response, "answers", None)
+        if not isinstance(answers, dict) or not answers:
+            return True
+        confs = [float(a["confidence"]) for a in answers.values()
+                 if isinstance(a, dict) and a.get("confidence") is not None]
+        return bool(confs) and min(confs) < _CTX_LOCAL_MIN_CONF
+    except Exception:
+        return True
+
+
+class _CtxJudge:
+    """``judge(state, questions)`` — local lane first, hosted on low confidence.
+
+    ``lane`` tracks which backend answered the last call so ctxscore's ledger
+    rows name the real lane. A local answer that is confident enough is
+    returned as-is; a hosted failure after a local answer keeps the local one.
+    """
+
+    def __init__(self, local: Any = None, hosted: Any = None) -> None:
+        self._local = local
+        self._hosted = hosted
+        self.lane = "local" if local is not None else "hosted"
+
+    def __call__(self, state: Any, questions: Dict[str, Any]) -> Any:
+        resp = None
+        if self._local is not None:
+            try:
+                resp = self._local.predict(state, questions)
+                self.lane = "local"
+            except Exception:
+                resp = None
+            if resp is not None and not _ctx_low_confidence(resp):
+                return resp
+        if self._hosted is not None:
+            try:
+                out = self._hosted.ask(state, questions)
+                self.lane = "hosted"
+                return out
+            except Exception:
+                if resp is not None:
+                    self.lane = "local"
+                    return resp
+                raise
+        if resp is not None:
+            return resp
+        raise RuntimeError("ctxscore: no judge lane answered")
 
 
 # ---------------------------------------------------------------------------
@@ -1482,6 +1740,12 @@ def _pre_llm_call(session_id: str = "", user_message: str = "",
     sanctioned, cache-safe channel. Silent unless something genuinely new landed.
     """
     try:
+        # The armed vacuum scores chunks against "the current goal"; the latest
+        # user message is that goal. Recorded for every session, independent of
+        # the instincts feature flag.
+        if isinstance(user_message, str) and user_message.strip():
+            with _LOCK:
+                _rec(session_id)["goal"] = _brief(user_message, 800)
         if not _enabled("instincts"):
             return None
         with _LOCK:
