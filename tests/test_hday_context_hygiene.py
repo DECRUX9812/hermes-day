@@ -329,3 +329,29 @@ def test_worst_case_request_count_and_refusal():
     assert ch.assert_within_ceiling(est, ceiling_requests=100) is est
     with pytest.raises(ch.BudgetRefused):
         ch.assert_within_ceiling(est, ceiling_requests=1000, ceiling_seconds=100.0)
+
+
+def test_output_and_hallucinated_tool_channels_keep_separate_counters():
+    # the output channel has its own budget and the same reset-on-success rule
+    b = ch.RetryBudget({"tools": 5, "output": 1})
+    b.note_output_failure()
+    with pytest.raises(ch.RetryExhausted) as ei:
+        b.note_output_failure()
+    assert ei.value.tool == "output" and ei.value.budget == 1
+    b.note_output_success()
+    assert b.output_remaining() == 1
+    assert b.counts.get("output", 0) == 0
+
+    # a hallucinated tool name gets its own budget under the invented name,
+    # bounded by the agent-wide tools budget
+    b.note_unknown_tool("read_fil")
+    assert b.counts["read_fil"] == 1 and b.remaining("read_fil") == 4
+    assert b.exhausted("read_fil") is False
+
+    # the "failed, do not retry" channel is tracked separately, consumes nothing,
+    # and leaves the tool's budget intact
+    b.note_failed("vault_read", reason="unrecoverable")
+    assert b.no_retry_counts["vault_read"] == 1
+    assert b.counts.get("vault_read", 0) == 0
+    assert b.remaining("vault_read") == 5
+    assert any(r["event"] == "failed" and r["retried"] is False for r in ch.LEDGER)
