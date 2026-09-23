@@ -201,6 +201,7 @@ _JUDGE_UNSET = object()        # sentinel: _GATE_JUDGE untouched -> use the live
 _GATE_JUDGE: Any = _JUDGE_UNSET  # test/embedder seam: callable | None (forces unjudged)
 _ESC_TTL = 5.0                 # approvals.mode/yolo are runtime state — short cache only
 _ESC_CACHE: Dict[str, Any] = {"at": 0.0, "value": True}
+_APPROVALS: Any = None         # hday_approvals, wired by _approvals()
 
 # ---------------------------------------------------------------------------
 # Detection tables
@@ -1597,7 +1598,12 @@ def _gate_log(sid: str, tool_name: str, args: Dict[str, Any],
                  "call": _call_preview(tool_name, args),
                  "allow": bool(allow), "directive": directive,
                  "reason": _brief(reason, 240)}
-        for k in ("rule", "detail", "signals", "mandate_explicit", "screen"):
+        for k in ("rule", "detail", "signals", "mandate_explicit", "screen",
+                  # HITL lane (hday_approvals): the interrupt token, its status,
+                  # the action hash the approval is bound to, and the rail trace.
+                  "interrupt", "status", "action_hash", "blast_radius",
+                  "capabilities", "durable", "responder", "prompt",
+                  "rail", "before_hash", "after_hash", "verdict", "guardrails"):
             if isinstance(row, dict) and k in row:
                 entry[k] = row[k]
         with _LOCK:
@@ -2437,6 +2443,104 @@ def _cmd_section_set(arg: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# HITL + capability safety (hday_approvals.py) — the lane's host wiring
+#
+# ``hday_approvals`` is a standalone module (like hday_gate/hday_ctxscore): it
+# owns the pause/resume contract, the capability vocabulary, the typed policy
+# verdict, the (passed, value) guardrail chain and the durable approval queue.
+# What it cannot own is the ONE ledger — that is this file's ``_gate_log`` — so
+# the wiring lives here: the module's ledger sink is a thin adapter onto the
+# session's existing ``gate`` rows, and its durable store is the plugin host's
+# state (the same store ``_persist()`` uses), which is what makes a pending
+# approval survive a process restart.
+#
+# The lane only ADDS rows and a command; it never relaxes the honesty guard.
+# ---------------------------------------------------------------------------
+
+_APPROVALS_KEY = "hday_approvals"     # durable queue key in ctx.state
+
+
+class _ApprovalsStateStore:
+    """Adapter: hday_approvals' durable store == the plugin host's state store."""
+
+    durable = True
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if _CTX is None:
+            return default
+        try:
+            return _CTX.state.get(key) or default
+        except Exception:
+            return default
+
+    def set(self, key: str, value: Any) -> None:
+        if _CTX is None:
+            raise OSError("no plugin context")
+        _CTX.state.set(key, value)
+
+
+def _approvals_ledger(row: Dict[str, Any]) -> None:
+    """The module's ledger sink: one row onto the session's ONE gate ledger.
+
+    Called by hday_approvals on every pause/resume/rail decision. Takes no lock
+    here — ``_gate_log`` takes ``_LOCK`` itself and persists.
+    """
+    try:
+        _gate_log(str((row or {}).get("session") or ""),
+                  str((row or {}).get("tool") or ""),
+                  {"command": str((row or {}).get("call") or "")},
+                  row or {}, bool((row or {}).get("allow")),
+                  str((row or {}).get("reason") or ""),
+                  directive=str((row or {}).get("directive") or "none"))
+    except Exception:
+        pass
+
+
+def _approvals() -> Optional[Any]:
+    """hday_approvals, configured against the ONE ledger + the host's state.
+
+    Re-configured on every call (three assignments) so a caller that dropped the
+    module's in-process state — a restart, a test — cannot silently fall back to
+    a store that writes nowhere.
+    """
+    global _APPROVALS
+    mod = _hday("hday_approvals")
+    if mod is None:
+        return None
+    _APPROVALS = mod
+    try:
+        mod.configure(ledger=_approvals_ledger, store=_ApprovalsStateStore(),
+                      escalation_available=_gate_escalation_available)
+    except Exception:
+        pass
+    return mod
+
+
+def _cmd_queue(arg: str = "") -> str:
+    """``[session_key]`` — the HITL approval queue: pending + recent resolutions."""
+    mod = _approvals()
+    if mod is None:
+        return json.dumps({"ok": False, "error": "hday_approvals unavailable"})
+    sid = (arg or "").strip()
+    try:
+        with _LOCK:
+            sessions = list(_SESSIONS.keys())
+        pending = [it.as_row() for it in mod.pending()]
+        recent = mod.recent()
+        if sid:
+            pending = [r for r in pending if sid in str(r.get("session") or "")]
+            recent = [r for r in recent if sid in str(r.get("session") or "")]
+        return json.dumps({"ok": True,
+                           "sessions": sessions,
+                           "pending": pending,
+                           "recent": recent,
+                           "store": _APPROVALS_KEY})
+    except Exception as exc:
+        return json.dumps({"ok": False,
+                           "error": f"{type(exc).__name__}: {exc}"})
+
+
+# ---------------------------------------------------------------------------
 # Approval lifecycle, attention ledger, mid-session instincts (observer hooks)
 #
 # ``pre_approval_request`` / ``post_approval_response`` are observer-only (they
@@ -3171,6 +3275,7 @@ def register(ctx: Any) -> None:
     global _CTX
     _CTX = ctx
     _load_persisted()
+    _approvals()          # wire the HITL lane onto the ONE ledger + host state
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("post_tool_call", _post_tool_call)
     ctx.register_hook("pre_verify", _pre_verify)
@@ -3259,6 +3364,11 @@ def register(ctx: Any) -> None:
     ctx.register_command(
         "day-ledger", _cmd_ledger,
         description="Decision ledger: gate + ctxscore rows (lane, status, cost, ms).",
+        args_hint="[session_key]",
+    )
+    ctx.register_command(
+        "day-queue", _cmd_queue,
+        description="HITL approval queue: pending interrupts + recent resolutions.",
         args_hint="[session_key]",
     )
     ctx.register_command(
