@@ -2351,6 +2351,8 @@ def _cmd_ledger(arg: str = "") -> str:
     ``ctxscore`` rows are hday_ctxscore's module ledger. Row shapes are the
     modules' own (kind|status, lane, ms, cost); the cockpit's view-model owns
     the display columns and the honest 'unknown' state for missing fields.
+    ``trace`` is the observability lane's additive span sidecar keyed by run id
+    — the same row shape, never a replacement for the two above.
     """
     sid = (arg or "").strip()
 
@@ -2370,9 +2372,58 @@ def _cmd_ledger(arg: str = "") -> str:
             ctx_rows = [dict(r) for r in getattr(cs, "LEDGER", None) or []]
         except Exception:
             ctx_rows = []
+    trace_rows = []
+    ht = _hday("hday_trace")
+    if ht is not None:
+        try:
+            trace_rows = [dict(r) for r in ht.ledger_rows()]
+        except Exception:
+            trace_rows = []
     return json.dumps({"ok": True,
                        "gate": _scoped(gate)[-_LEDGER_CAP:],
-                       "ctxscore": _scoped(ctx_rows)[-_LEDGER_CAP:]})
+                       "ctxscore": _scoped(ctx_rows)[-_LEDGER_CAP:],
+                       "trace": _scoped(trace_rows)[-_LEDGER_CAP:]})
+
+
+def _cmd_trace(arg: str = "") -> str:
+    """``[run_id|trace_id]`` — one run's observation tree, as compact text.
+
+    No arg: the runs in the trace sidecar (id, run, spans, status, ms). With an
+    id: that run's rows, rendered by hday_trace.render_tree for the cockpit/TUI.
+    An unknown id is an honest miss, never an empty tree.
+    """
+    ht = _hday("hday_trace")
+    if ht is None:
+        return json.dumps({"ok": False, "error": "hday_trace unavailable"})
+    try:
+        ident = (arg or "").strip()
+        rows = [dict(r) for r in ht.ledger_rows()]
+        if not ident:
+            traces = []
+            for trace_id, group in ht.group_by_trace(rows).items():
+                head = group[0] if group else {}
+                traces.append({
+                    "trace_id": trace_id,
+                    "run_id": str(head.get("run_id") or ""),
+                    "spans": len(group),
+                    "status": ("error" if any(
+                        str(r.get("status") or "") == "error" for r in group)
+                        else "ok"),
+                    "ms": round(float(head.get("ms") or 0.0), 3),
+                })
+            return json.dumps({"ok": True, "traces": traces})
+        picked = ht.ledger_rows(run_id=ident) or ht.ledger_rows(trace_id=ident)
+        if not picked:
+            return json.dumps({"ok": False,
+                               "error": f"no run {ident!r} in the trace ledger"})
+        head = picked[0]
+        return json.dumps({"ok": True,
+                           "trace_id": str(head.get("trace_id") or ""),
+                           "run_id": str(head.get("run_id") or ""),
+                           "rows": len(picked),
+                           "text": ht.render_tree(picked)})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": f"trace failed: {exc}"})
 
 
 def _section_states() -> Dict[str, Dict[str, Any]]:
@@ -3260,6 +3311,11 @@ def register(ctx: Any) -> None:
         "day-ledger", _cmd_ledger,
         description="Decision ledger: gate + ctxscore rows (lane, status, cost, ms).",
         args_hint="[session_key]",
+    )
+    ctx.register_command(
+        "day-trace", _cmd_trace,
+        description="One run's observation tree (trace > span > generation) as text.",
+        args_hint="[run_id|trace_id]",
     )
     ctx.register_command(
         "day-sections", _cmd_sections,
