@@ -197,6 +197,8 @@ _GATE_MOD: Any = None          # hday_gate, path-loaded once (sibling file, no s
 _GATE_MOD_TRIED = False
 _JEV_MOD: Any = None           # sibling jev-shield's shield_jev, path-loaded once
 _JEV_MOD_TRIED = False
+_DURABLE_MOD: Any = None       # hday_durable, path-loaded once (DURABLE-STATE lane)
+_DURABLE_MOD_TRIED = False
 _JUDGE_UNSET = object()        # sentinel: _GATE_JUDGE untouched -> use the live adapter
 _GATE_JUDGE: Any = _JUDGE_UNSET  # test/embedder seam: callable | None (forces unjudged)
 _ESC_TTL = 5.0                 # approvals.mode/yolo are runtime state — short cache only
@@ -1457,6 +1459,57 @@ def _load_hday_gate() -> Any:
     except Exception:
         _GATE_MOD = None
     return _GATE_MOD
+
+
+def _load_hday_durable() -> Any:
+    """Path-load the sibling ``hday_durable.py`` once (same convention as
+    ``hday_gate.py``): no sys.path assumption, and a missing module degrades to
+    "no durable lane" rather than a crash."""
+    global _DURABLE_MOD, _DURABLE_MOD_TRIED
+    if _DURABLE_MOD_TRIED:
+        return _DURABLE_MOD
+    _DURABLE_MOD_TRIED = True
+    try:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "hday_durable.py")
+        spec = importlib.util.spec_from_file_location("hday_durable_runtime", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["hday_durable_runtime"] = mod
+        spec.loader.exec_module(mod)
+        _DURABLE_MOD = mod
+    except Exception:
+        _DURABLE_MOD = None
+    return _DURABLE_MOD
+
+
+def _durable_sink(sid: str) -> Callable[[Dict[str, Any]], None]:
+    """The sink hday_durable rows go to: the ONE decision ledger (``rec["gate"]``).
+
+    Same writer the gate uses (``_append`` + ``_persist``) — a durable row is a
+    decision row, so it must not live in a second store. Never raises.
+    """
+    def sink(row: Dict[str, Any]) -> None:
+        try:
+            row = row if isinstance(row, dict) else {}
+            entry: Dict[str, Any] = {
+                "kind": str(row.get("kind") or "durable"),
+                "lane": str(row.get("lane") or "local"),
+                "ms": float(row.get("ms") or 0.0),
+                "cost": float(row.get("cost") or 0.0),
+                "ts": time.time(),
+                "reason": _brief(str(row.get("reason") or ""), 240)}
+            for key, value in row.items():
+                if key not in entry:
+                    entry[key] = value
+            with _LOCK:
+                rec = _rec(sid)
+                _append(rec["gate"], entry, _MAX_GATE)
+                rec["at"] = time.time()
+                _persist()
+        except Exception:
+            pass
+    return sink
 
 
 def _load_shield_jev() -> Any:
