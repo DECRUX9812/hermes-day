@@ -205,17 +205,55 @@ def test_external_blast_with_explicit_mandate_is_allowed(day, monkeypatch):
 
 
 def test_escalation_without_a_reachable_human_blocks(day, monkeypatch):
-    """approvals.mode=off / yolo: emitting `approve` would auto-approve, so the
-    gate must block instead — same fail-closed rule jev-shield enforces."""
+    """approvals.mode=off: no human can answer, so the gate must block rather
+    than emit `approve` (which core would auto-approve) — fail closed."""
     module, ctx, sid = day
     _mandate(module, sid)
     _set_judge(module, monkeypatch,
                _judge(intent_consistent=0.1, irreversible=0.9,
                       blast_radius="machine"))
     monkeypatch.setattr(module, "_gate_escalation_available", lambda: False)
+    monkeypatch.setattr(module, "_gate_yolo_active", lambda: False)
     out = _call(module, sid, "rm -rf src/")
     assert isinstance(out, dict) and out["action"] == "block", out
     assert _rows(module, sid)[-1]["allow"] is False
+
+
+def test_yolo_mode_allows_and_records_instead_of_blocking(day, monkeypatch):
+    """approvals.mode=yolo is the operator pre-authorising every action: a flagged
+    call is allowed and written to the ledger for audit, never blocked.
+
+    Blocking under yolo deadlocks the agent against its own operator with no way
+    out — the wedge this test pins shut.
+    """
+    module, ctx, sid = day
+    _mandate(module, sid)
+    _set_judge(module, monkeypatch,
+               _judge(intent_consistent=0.1, irreversible=0.9,
+                      blast_radius="machine"))
+    monkeypatch.setattr(module, "_gate_escalation_available", lambda: False)
+    monkeypatch.setattr(module, "_gate_yolo_active", lambda: True)
+    out = _call(module, sid, "rm -rf src/")
+    assert out is None, out
+    row = _rows(module, sid)[-1]
+    assert row["kind"] == "judged"
+    assert row["directive"] == "allow-yolo"
+    assert row["allow"] is True
+
+
+def test_yolo_never_softens_the_regex_honesty_guard(day, monkeypatch):
+    """yolo waives the typed gate, never the honesty deny-list: a regex veto
+    (the mirrored exit-code-laundering patterns) still blocks even when the
+    operator has pre-authorised everything."""
+    module, ctx, sid = day
+    _mandate(module, sid)
+    _set_judge(module, monkeypatch, _judge())
+    monkeypatch.setattr(module, "_gate_yolo_active", lambda: True)
+    monkeypatch.setattr(module, "_gate_escalation_available", lambda: False)
+    out = _call(module, sid, "pytest --force tests")
+    assert isinstance(out, dict) and out["action"] == "block", out
+    row = _rows(module, sid)[-1]
+    assert row["kind"] == "regex_hit"
 
 
 def test_cached_denial_still_escalates_without_repurchasing(day, monkeypatch):

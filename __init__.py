@@ -1616,6 +1616,23 @@ def _mandate_explicit(rec: Dict[str, Any]) -> bool:
     return False
 
 
+def _gate_yolo_active() -> bool:
+    """Is the operator in ``approvals.mode: yolo`` — i.e. has every action been
+    pre-authorised, with no prompt anywhere in the loop?
+
+    Kept separate from ``_gate_escalation_available`` on purpose: yolo means
+    "a human is never asked", which is NOT the same as "a human is unavailable
+    to record a mandate". Under yolo a flagged call is allowed-and-audited
+    (the operator already said yes to everything), never escalated and never
+    hard-blocked.
+    """
+    try:
+        from tools.approval import _yolo_active  # type: ignore
+        return bool(_yolo_active())
+    except Exception:
+        return False
+
+
 def _gate_escalation_available() -> bool:
     """Can an ``approve`` directive actually reach a human right now?
 
@@ -1763,6 +1780,15 @@ def _typed_gate(tool_name: str, args: Dict[str, Any],
                       str(row.get("rule") or "Honesty Guard"), args)
     directive = "none"
     if not allow:
+        # yolo = the operator pre-authorised everything, so there is nothing to
+        # ask and nothing to escalate: allow it and keep the judged row in the
+        # ledger for audit. The regex honesty veto above already returned, so
+        # this waives the TYPED gate only, never the deny-list.
+        if _gate_yolo_active():
+            _gate_log(sid, tool_name, args, row, True,
+                      reason + " — allowed: yolo pre-authorises (no prompt)",
+                      directive="allow-yolo")
+            return None
         directive = "approve" if _gate_escalation_available() else "block"
     _gate_log(sid, tool_name, args, row, allow, reason, directive=directive)
     if directive == "approve":
