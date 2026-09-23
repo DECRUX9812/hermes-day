@@ -167,6 +167,11 @@ def _hday(name: str) -> Optional[Any]:
     ``__file__`` keeps the worktree/live copies isolated the same way the
     patches loader is. A missing/broken module caches ``None`` and the caller
     degrades to "that telemetry is absent", never a wedge on the hot path.
+
+    This is the ONE loader for sibling modules (``_load_hday_durable`` is a thin
+    alias to it): the loaded module is registered in ``sys.modules`` under its
+    own name for the duration of the exec, which CPython's ``dataclasses``
+    needs, and which keeps one module instance per process.
     """
     if name in _HDAY_MODS:
         return _HDAY_MODS[name]
@@ -185,7 +190,22 @@ def _hday(name: str) -> Optional[Any]:
             spec = ilu.spec_from_file_location(name, path)
             if spec is not None and spec.loader is not None:
                 mod = ilu.module_from_spec(spec)
-                spec.loader.exec_module(mod)
+                # A module-level @dataclass cannot be exec'd from a bare spec:
+                # dataclasses resolves ``cls.__module__`` through sys.modules
+                # while the class body runs, so an unregistered module raises
+                # AttributeError and the lane silently degrades to "absent".
+                # Register before exec and evict on failure (the host's own
+                # plugin loader does the same) — only when the name is free, so
+                # a same-named module from another install is never clobbered.
+                registered = sys.modules.get(name) is None
+                if registered:
+                    sys.modules[name] = mod
+                try:
+                    spec.loader.exec_module(mod)
+                except BaseException:
+                    if registered:
+                        sys.modules.pop(name, None)
+                    raise
     except Exception:
         mod = None
     _HDAY_MODS[name] = mod
@@ -197,8 +217,6 @@ _GATE_MOD: Any = None          # hday_gate, path-loaded once (sibling file, no s
 _GATE_MOD_TRIED = False
 _JEV_MOD: Any = None           # sibling jev-shield's shield_jev, path-loaded once
 _JEV_MOD_TRIED = False
-_DURABLE_MOD: Any = None       # hday_durable, path-loaded once (DURABLE-STATE lane)
-_DURABLE_MOD_TRIED = False
 _JUDGE_UNSET = object()        # sentinel: _GATE_JUDGE untouched -> use the live adapter
 _GATE_JUDGE: Any = _JUDGE_UNSET  # test/embedder seam: callable | None (forces unjudged)
 _ESC_TTL = 5.0                 # approvals.mode/yolo are runtime state — short cache only
@@ -1463,25 +1481,15 @@ def _load_hday_gate() -> Any:
 
 
 def _load_hday_durable() -> Any:
-    """Path-load the sibling ``hday_durable.py`` once (same convention as
-    ``hday_gate.py``): no sys.path assumption, and a missing module degrades to
-    "no durable lane" rather than a crash."""
-    global _DURABLE_MOD, _DURABLE_MOD_TRIED
-    if _DURABLE_MOD_TRIED:
-        return _DURABLE_MOD
-    _DURABLE_MOD_TRIED = True
-    try:
-        import importlib.util
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "hday_durable.py")
-        spec = importlib.util.spec_from_file_location("hday_durable_runtime", path)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["hday_durable_runtime"] = mod
-        spec.loader.exec_module(mod)
-        _DURABLE_MOD = mod
-    except Exception:
-        _DURABLE_MOD = None
-    return _DURABLE_MOD
+    """Path-load the sibling ``hday_durable.py`` through the ONE sibling loader.
+
+    Kept as a named seam (the lane's tests call it, and a hook may), but it
+    delegates to ``_hday``: the durable lane originally loaded its module under
+    a private ``hday_durable_runtime`` name, so ``_hday("hday_durable")`` and
+    this function handed out two distinct module objects — split module state,
+    exactly what the one-store rule forbids. One loader, one instance.
+    """
+    return _hday("hday_durable")
 
 
 def _durable_sink(sid: str) -> Callable[[Dict[str, Any]], None]:
