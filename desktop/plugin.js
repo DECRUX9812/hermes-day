@@ -208,7 +208,22 @@ function ensureDayStyles() {
     '.hday-receipt{border:1px dashed currentColor;border-radius:4px;padding:.5rem .6rem;' +
       'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.66rem;line-height:1.55}' +
     '.hday-receipt-row{display:flex;gap:.5rem;justify-content:space-between}' +
-    '.hday-receipt-sep{border-top:1px dashed currentColor;opacity:.35;margin:.35rem 0}'
+    '.hday-receipt-sep{border-top:1px dashed currentColor;opacity:.35;margin:.35rem 0}' +
+    // compact cockpit — left-column view tabs + toolkit accordion + narrow-screen stacking
+    '.hday-ltab{cursor:pointer;border-bottom:1px solid transparent;padding:.3rem .1rem;font-size:.68rem;font-weight:600}' +
+    '.hday-ltab:hover{color:#f3f4f6}' +
+    '.hday-ltab.hday-tab-on{color:#f3f4f6;border-bottom-color:#38bdf8}' +
+    '.hday-acc-head{cursor:pointer}' +
+    '.hday-acc-head:hover{background:#1a1d26}' +
+    '.hday-mview-toggle{display:none}' +
+    '@media (max-width:1023px){' +
+      '.hday-left{width:100%!important;min-width:0!important;max-width:none!important;border-right:none!important}' +
+      '.hday-right{display:none!important}' +
+      '.hday-root[data-mview=\"detail\"] .hday-left{display:none!important}' +
+      '.hday-root[data-mview=\"detail\"] .hday-right{display:flex!important}' +
+      '.hday-mview-toggle{display:inline-flex}' +
+      '.hday-hide-narrow{display:none!important}' +
+    '}'
   // F1: hand the sentinel palette to the CSS text builder (hoisted decl)
   if (typeof SKIN_COLOR_CSS === 'string' && SKIN_COLOR_CSS) {
     const skin = hdaySkinCss(SKIN_COLOR_CSS)
@@ -735,12 +750,15 @@ function SectionLabel({ icon, title, count, color, action }) {
 }
 
 /** flat KPI tile — bold count, muted label, color only on the state dot/icon */
-function StatTile({ icon, label, n, color, scrollTo }) {
+function StatTile({ icon, label, n, color, scrollTo, onNav }) {
   return jsxs('button', {
     type: 'button',
-    className: 'hday-stat flex min-w-0 items-center gap-3 rounded-lg px-3.5 py-2.5 text-left',
+    className: 'hday-stat flex min-w-0 items-center gap-2 rounded-lg px-2.5 py-1.5 text-left',
     style: { background: C.surface, border: `1px solid ${C.border}` },
     onClick: () => {
+      if (onNav) {
+        try { onNav() } catch {}
+      }
       if (scrollTo) {
         try {
           document.getElementById(scrollTo)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -756,7 +774,7 @@ function StatTile({ icon, label, n, color, scrollTo }) {
       jsxs('span', {
         className: 'flex min-w-0 items-baseline gap-2',
         children: [
-          jsx('span', { className: 'text-xl font-bold leading-6 tabular-nums', style: { color: C.text }, children: String(n) }),
+          jsx('span', { className: 'text-base font-bold leading-5 tabular-nums', style: { color: C.text }, children: String(n) }),
           jsx('span', { className: 'truncate text-[0.68rem] font-medium uppercase tracking-wider', style: { color: C.faint }, children: label })
         ]
       })
@@ -2909,7 +2927,7 @@ function GhostDock({ e, route, runtimeId, storedId }) {
 
 const INSP_TABS = [['details', 'Details'], ['evidence', 'Evidence'], ['impact', 'Impact'], ['ledger', 'Ledger'], ['diff', 'Diff'], ['trace', 'Trace']]
 
-function Inspector({ e, evMap }) {
+function Inspector({ e, evMap, onBack }) {
   const [tab, setTab] = useState('details')
   const [scrub, setScrub] = useState(null)
   const [reverting, setReverting] = useState(false)
@@ -2999,6 +3017,15 @@ function Inspector({ e, evMap }) {
         className: 'flex shrink-0 items-center gap-2 px-3 py-2',
         style: { borderBottom: `1px solid ${C.border}` },
         children: [
+          onBack
+            ? jsx('button', {
+                type: 'button',
+                className: 'hday-mview-toggle items-center gap-1 rounded-md px-1.5 py-1 text-[0.66rem] font-semibold',
+                style: { color: C.muted, background: C.surface, border: `1px solid ${C.border}` },
+                onClick: onBack,
+                children: '‹ Back'
+              })
+            : null,
           jsx(Codicon, { name: st.icon, className: 'text-[0.8rem]', style: { color: st.color } }),
           jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.82rem] font-semibold', style: { color: C.text }, children: title }),
           jsx(AgoText, { ms: feedAt(e) }),
@@ -10212,32 +10239,59 @@ const HDAY_PANELS = [
 ];
 /** The toolkit band: every lane's panel, one row per feature. */
 function ToolkitGrid({ scan, cronJobs }) {
+  const [open, setOpen] = useState(null)
   if (!HDAY_PANELS.length) return null;
-  return jsxs('div', { className: 'flex flex-col gap-4',
+  return jsxs('div', { className: 'flex flex-col gap-1.5',
     children: [
       jsxs('div', {
-        className: 'flex items-center gap-2',
+        className: 'flex items-center gap-2 px-1',
         children: [
           jsx(Codicon, { name: 'tools', size: 12,
                         style: { color: C.mono } }),
           jsx('span', {
             className: 'text-[0.62rem] font-semibold uppercase tracking-wider',
-            style: { color: C.faint }, children: 'toolkit' }),
+            style: { color: C.faint }, children: `toolkit · ${HDAY_PANELS.length}` }),
+          open
+            ? jsx('button', {
+                type: 'button',
+                className: 'ml-auto text-[0.62rem]',
+                style: { color: C.faint },
+                onClick: () => setOpen(null),
+                children: 'collapse all'
+              })
+            : null,
         ],
       }),
-      ...HDAY_PANELS.map(([name, Comp]) =>
-        jsxs('div', { className: 'hday-card p-3',
+      ...HDAY_PANELS.map(([name, Comp]) => {
+        const isOpen = open === name
+        return jsxs('div', { className: 'hday-card overflow-hidden rounded-lg',
+          style: { background: C.surface, border: `1px solid ${C.border}` },
           children: [
-            jsx('div', {
-              className: 'mb-1.5 text-[0.6rem] font-semibold uppercase',
-              style: { color: C.faint }, children: name }),
-            jsx(Comp, Comp === hdayPanel10
-              ? { scan: scan || null, jobs: cronJobs || null,
-                  hiddenCount: scan ? (scan.hiddenCount || 0) : null,
-                  scannedAt: Date.now() }
-              : {}),
+            jsx('button', {
+              type: 'button',
+              className: 'hday-acc-head flex w-full items-center gap-2 px-2.5 py-2 text-left',
+              onClick: () => { setOpen(isOpen ? null : name); haptic('selection') },
+              children: [
+                jsx(Codicon, { name: isOpen ? 'chevron-down' : 'chevron-right', size: 12, style: { color: C.faint } }),
+                jsx('span', {
+                  className: 'min-w-0 flex-1 truncate text-[0.6rem] font-semibold uppercase tracking-wider',
+                  style: { color: isOpen ? C.text : C.faint }, children: name }),
+              ].filter(Boolean),
+            }),
+            isOpen
+              ? jsx('div', {
+                  className: 'px-2.5 pb-2.5',
+                  style: { borderTop: `1px solid ${C.border}` },
+                  children: jsx(Comp, Comp === hdayPanel10
+                    ? { scan: scan || null, jobs: cronJobs || null,
+                        hiddenCount: scan ? (scan.hiddenCount || 0) : null,
+                        scannedAt: Date.now() }
+                    : {}),
+                })
+              : null,
           ],
-        }, name)),
+        }, name)
+      }),
     ],
   });
 }
@@ -10252,6 +10306,8 @@ function DayPage() {
   const [celebrate, setCelebrate] = useState(false)
   const [focus, setFocus] = useState(false)
   const [instOpen, setInstOpen] = useState(false)
+  const [leftTab, setLeftTab] = useState('feed')
+  const [mview, setMview] = useState('feed')
   const reducedRM = hdayUseReducedMotion()  // F3
   const prevNeeds = useRef(null)
   const pinnedMap = useValue($pinned)
@@ -10359,13 +10415,14 @@ function DayPage() {
         jsx('div', {
           className: 'flex flex-col',
           children: feed.filter(e => e.type === type).map(e =>
-            jsx(FeedRow, { e, idx: feedIndex.get(e.key), selected: feedIndex.get(e.key) === sel, evMap, onSelect: () => setSel(feedIndex.get(e.key) ?? 0) }, e.key))
+            jsx(FeedRow, { e, idx: feedIndex.get(e.key), selected: feedIndex.get(e.key) === sel, evMap, onSelect: () => { setSel(feedIndex.get(e.key) ?? 0); setMview('detail') } }, e.key))
         })
       ]
     })
 
   return jsxs('div', {
     className: 'hday-root flex h-full min-h-0 flex-col',
+    'data-mview': mview,
     style: {
       background: C.canvas,
       color: C.text,
@@ -10381,14 +10438,14 @@ function DayPage() {
     children: [
       celebrate && !reducedRM ? jsx(Confetti, { onDone: () => setCelebrate(false) }) : null,
       jsxs('header', {
-        className: 'flex shrink-0 items-center justify-between gap-4 px-6 py-4',
+        className: 'flex shrink-0 items-center justify-between gap-3 px-4 py-2.5',
         style: { borderBottom: `1px solid ${C.border}` },
         children: [
           jsxs('div', {
             className: 'flex min-w-0 items-baseline gap-3',
             children: [
               jsx('h1', { className: 'text-lg font-semibold tracking-tight', children: `${greeting()}` }),
-              jsx('span', { className: 'truncate text-[0.75rem] text-muted-foreground', children: dateStr })
+              jsx('span', { className: 'hday-hide-narrow truncate text-[0.75rem] text-muted-foreground', children: dateStr })
             ]
           }),
           jsx(DayArc, {}),
@@ -10453,6 +10510,26 @@ function DayPage() {
                   children: jsx(Codicon, { name: focus ? 'eye-closed' : 'eye', className: focus ? '' : 'text-muted-foreground' })
                 })
               }),
+              jsxs('div', {
+                className: 'hday-mview-toggle items-center gap-1 rounded-lg p-0.5',
+                style: { background: C.surface, border: `1px solid ${C.border}` },
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    className: 'rounded-md px-2 py-1 text-[0.66rem] font-semibold',
+                    style: mview === 'feed' ? { background: C.surfaceHover, color: C.text } : { color: C.faint },
+                    onClick: () => setMview('feed'),
+                    children: 'Feed'
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className: 'rounded-md px-2 py-1 text-[0.66rem] font-semibold',
+                    style: mview === 'detail' ? { background: C.surfaceHover, color: C.text } : { color: C.faint },
+                    onClick: () => setMview('detail'),
+                    children: 'Detail'
+                  })
+                ]
+              }),
               jsx(Tip, {
                 label: 'Refresh',
                 children: jsx(Button, {
@@ -10471,19 +10548,19 @@ function DayPage() {
         children: [
           // LEFT — the action feed
           jsxs('section', {
-            className: 'flex w-[38%] min-w-[300px] max-w-[480px] shrink-0 flex-col',
+            className: 'hday-left flex w-[36%] min-w-[280px] max-w-[420px] shrink-0 flex-col',
             style: { borderRight: `1px solid ${C.border}` },
             children: [
               jsxs('div', {
                 className: 'shrink-0 px-3 pt-3',
                 children: [
                   jsxs('div', {
-                    className: 'mb-2 grid grid-cols-2 gap-1.5 xl:grid-cols-4',
+                    className: 'mb-2 grid grid-cols-4 gap-1.5',
                     children: [
-                      jsx(StatTile, { icon: 'bell-dot', label: 'Waiting', n: needs.length, color: '#f59e0b', scrollTo: 'hday-needs' }),
-                      jsx(StatTile, { icon: 'rocket', label: 'In flight', n: flight.length, color: '#58a6ff', scrollTo: 'hday-flight' }),
-                      jsx(StatTile, { icon: 'pass', label: 'Review', n: finished.length, color: '#34d399', scrollTo: 'hday-finished' }),
-                      jsx(StatTile, { icon: 'calendar', label: 'Scheduled', n: jobs.length, color: '#a855f7', scrollTo: 'hday-sched' })
+                      jsx(StatTile, { icon: 'bell-dot', label: 'Waiting', n: needs.length, color: '#f59e0b', scrollTo: 'hday-needs', onNav: () => setLeftTab('feed') }),
+                      jsx(StatTile, { icon: 'rocket', label: 'In flight', n: flight.length, color: '#58a6ff', scrollTo: 'hday-flight', onNav: () => setLeftTab('feed') }),
+                      jsx(StatTile, { icon: 'pass', label: 'Review', n: finished.length, color: '#34d399', scrollTo: 'hday-finished', onNav: () => setLeftTab('feed') }),
+                      jsx(StatTile, { icon: 'calendar', label: 'Scheduled', n: jobs.length, color: '#a855f7', scrollTo: 'hday-sched', onNav: () => setLeftTab('plan') })
                     ]
                   }),
                   jsxs('div', {
@@ -10522,6 +10599,32 @@ function DayPage() {
                   })
                 ]
               }),
+              jsxs('div', {
+                className: 'flex shrink-0 items-center gap-4 px-3 pb-1',
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    className: cn('hday-ltab', leftTab === 'feed' && 'hday-tab-on'),
+                    style: { color: leftTab === 'feed' ? C.text : C.faint },
+                    onClick: () => { setLeftTab('feed'); haptic('selection') },
+                    children: `Feed · ${needs.length + flight.length + finished.length}`
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className: cn('hday-ltab', leftTab === 'tools' && 'hday-tab-on'),
+                    style: { color: leftTab === 'tools' ? C.text : C.faint },
+                    onClick: () => { setLeftTab('tools'); haptic('selection') },
+                    children: `Toolkit · ${HDAY_PANELS.length}`
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className: cn('hday-ltab', leftTab === 'plan' && 'hday-tab-on'),
+                    style: { color: leftTab === 'plan' ? C.text : C.faint },
+                    onClick: () => { setLeftTab('plan'); haptic('selection') },
+                    children: `Plan · ${jobs.length + sources.length + watching.length}`
+                  })
+                ]
+              }),
               jsx(ScrollArea, {
                 className: 'min-h-0 flex-1',
                 children: jsxs('div', {
@@ -10534,7 +10637,7 @@ function DayPage() {
                         })
                       : null,
                     scan.isError ? jsx(ErrorState, { title: 'Scan failed', description: errMsg(scan.error) }) : null,
-                    needs.length
+                    leftTab === 'feed' && needs.length
                       ? jsxs('div', {
                           children: [
                             feedSection('hday-needs', 'bell-dot', 'Needs you', needs.length, '#f59e0b', 'need',
@@ -10556,9 +10659,9 @@ function DayPage() {
                           ]
                         })
                       : null,
-                    waiting.length ? feedSection(null, 'watch', 'Waiting on input', waiting.length, '#f59e0b', 'waiting') : null,
-                    flight.length ? feedSection('hday-flight', 'rocket', 'In flight', flight.length, '#34d399', 'flight') : null,
-                    finished.length
+                    leftTab === 'feed' && waiting.length ? feedSection(null, 'watch', 'Waiting on input', waiting.length, '#f59e0b', 'waiting') : null,
+                    leftTab === 'feed' && flight.length ? feedSection('hday-flight', 'rocket', 'In flight', flight.length, '#34d399', 'flight') : null,
+                    leftTab === 'feed' && finished.length
                       ? feedSection('hday-finished', 'pass', 'Finished — review', finished.length, '#34d399', 'finished',
                           jsx(Button, {
                             size: 'xs',
@@ -10573,13 +10676,13 @@ function DayPage() {
                             children: 'Clear all'
                           }))
                       : null,
-                    hiddenCount
+                    leftTab === 'feed' && hiddenCount
                       ? jsxs('div', {
                           className: 'px-2 text-[0.68rem] text-muted-foreground/60',
                           children: [`${hiddenCount} item${hiddenCount === 1 ? '' : 's'} snoozed or muted`]
                         })
                       : null,
-                    empty
+                    leftTab === 'feed' && empty
                       ? jsxs('div', {
                           className: 'flex flex-col items-center gap-3 py-12 text-center',
                           children: [
@@ -10591,7 +10694,7 @@ function DayPage() {
                           ]
                         })
                       : null,
-                    !focus && watching.length
+                    leftTab === 'plan' && watching.length
                       ? jsxs('section', {
                           children: [
                             jsx(SectionLabel, { icon: 'pinned', title: 'Watching', count: watching.length, color: '#58a6ff' }),
@@ -10599,7 +10702,7 @@ function DayPage() {
                           ]
                         })
                       : null,
-                    !focus
+                    leftTab === 'plan'
                       ? jsxs('section', {
                           id: 'hday-sched',
                           children: [
@@ -10610,7 +10713,7 @@ function DayPage() {
                           ]
                         })
                       : null,
-                    !focus
+                    leftTab === 'plan'
                       ? jsxs('section', {
                           children: [
                             jsx(SectionLabel, { icon: 'server-environment', title: 'Sources', count: sources.length }),
@@ -10649,7 +10752,9 @@ function DayPage() {
                           ]
                         })
                       : null,
-                    jsx(ToolkitGrid, { scan: scan.data || null, cronJobs: cron.data ? cron.data.jobs : null }),
+                    leftTab === 'tools'
+                      ? jsx(ToolkitGrid, { scan: scan.data || null, cronJobs: cron.data ? cron.data.jobs : null })
+                      : null,
                     jsx('div', {
                       className: 'px-2 pt-2 text-[0.68rem]',
                       style: { borderTop: `1px solid ${C.border}`, color: C.faint },
@@ -10662,10 +10767,10 @@ function DayPage() {
           }),
           // RIGHT — the live inspector
           jsxs('section', {
-            className: 'relative flex min-w-0 flex-1 flex-col',
+            className: 'hday-right relative flex min-w-0 flex-1 flex-col',
             style: { background: '#0e1117' },
             children: [
-              jsx(Inspector, { e: selEntry, evMap }),
+              jsx(Inspector, { e: selEntry, evMap, onBack: () => setMview('feed') }),
               jsx(InstinctsDrawer, {
                 open: instOpen,
                 onClose: () => setInstOpen(false),

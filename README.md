@@ -18,8 +18,15 @@ Hermes Day is a full-screen desktop plugin for [Hermes Agent](https://github.com
 
 The header carries a live **day arc** (a sun tracking 6 am–6 pm), a time-of-day
 tint, and a stat strip. Below it, four **clickable stat tiles** — waiting,
-in flight, to review, scheduled — scroll you to their section. The rail ends
+in flight, to review, scheduled — jump you to their section. The rail ends
 with a digest line: today, finished, triaged.
+
+The left rail is tabbed for day-to-day use: **Feed** (only what needs you,
+what's running, and what's finished — the daily driver), **Toolkit** (the ten
+power panels, collapsed accordion-style so they cost one row each until you
+open one), and **Plan** (watching, scheduled jobs, sources). On narrow screens
+the page stacks into **Feed / Detail** views with a toggle in the header, so
+the inspector never squeezes the triage list.
 
 Cards are **kind-tinted** (a subtle gradient keyed to approval / question /
 input), lift on hover, and commands render in a dark terminal block — the board
